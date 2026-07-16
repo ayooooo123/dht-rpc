@@ -1365,3 +1365,5 @@ function createDHT(opts) {
 function createBootstrapper(port, opts) {
   return DHT.bootstrapper(port, '127.0.0.1', { ...opts, host: '127.0.0.1' })
 }
+
+require('./test/request-transport')

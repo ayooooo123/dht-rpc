@@ -8,10 +8,16 @@ const NatSampler = require('nat-sampler')
 const b4a = require('b4a')
 const NetworkHealth = require('./lib/health')
 const IO = require('./lib/io')
+const RequestTransport = require('./lib/request-transport')
 const Query = require('./lib/query')
 const Session = require('./lib/session')
 const peer = require('./lib/peer')
-const { UNKNOWN_COMMAND, INVALID_TOKEN } = require('./lib/errors')
+const {
+  UNKNOWN_COMMAND,
+  INVALID_TOKEN,
+  DIRECT_IO_FORBIDDEN,
+  TRANSPORT_INVALID
+} = require('./lib/errors')
 const { PING, PING_NAT, FIND_NODE, DOWN_HINT, DELAYED_PING } = require('./lib/commands')
 
 const TMP = b4a.allocUnsafe(32)
@@ -29,14 +35,48 @@ const DEFAULTS = {
   maxPingDelay: 10_000
 }
 
+const TRANSPORT_DEFAULTS = {
+  requestTimeout: 1_000,
+  maxTransportCandidates: 256
+}
+
+const DIRECT_ONLY_OPTIONS = [
+  'bootstrap',
+  'nodes',
+  'udx',
+  'port',
+  'host',
+  'firewalled',
+  'anyPort',
+  'ephemeral',
+  'socket'
+]
+
 class DHT extends EventEmitter {
   constructor(opts = {}) {
     super()
 
+    this.outboundPolicy = validatePolicy(opts)
+
+    if (this.outboundPolicy === 'direct' && opts.requestTransport !== undefined) {
+      throw TRANSPORT_INVALID('requestTransport requires transport-only')
+    }
+
+    if (this.outboundPolicy === 'transport-only') {
+      for (const option of DIRECT_ONLY_OPTIONS) {
+        if (Object.prototype.hasOwnProperty.call(opts, option)) {
+          throw DIRECT_IO_FORBIDDEN(`${option} is unavailable with transport-only`)
+        }
+      }
+
+      this._initRequestTransport(opts)
+      return
+    }
+
     this.bootstrapNodes = opts.bootstrap === false ? [] : (opts.bootstrap || []).map(parseNode)
     this.table = new Table(randomBytes(32))
     this.nodes = new TOS()
-    this.udx = opts.udx || new UDX()
+    this.udx = opts.udx || (opts.udxFactory || defaultUDXFactory)()
     this.io = new IO(this.table, this.udx, {
       ...opts,
       onrequest: this._onrequest.bind(this),
@@ -99,6 +139,55 @@ class DHT extends EventEmitter {
     }
   }
 
+  _initRequestTransport(opts) {
+    this.requestTimeout = validatePositiveInteger(
+      opts.requestTimeout,
+      TRANSPORT_DEFAULTS.requestTimeout,
+      'requestTimeout'
+    )
+    this.maxTransportCandidates = validateIntegerRange(
+      opts.maxTransportCandidates,
+      TRANSPORT_DEFAULTS.maxTransportCandidates,
+      20,
+      4096,
+      'maxTransportCandidates'
+    )
+
+    this.bootstrapNodes = []
+    this.table = null
+    this.nodes = null
+    this.udx = null
+    this.io = new RequestTransport(opts.requestTransport, {
+      requestTimeout: this.requestTimeout,
+      maxTransportCandidates: this.maxTransportCandidates
+    })
+    this.health = null
+
+    this.concurrency = opts.concurrency || DEFAULTS.concurrency
+    this.maxPingDelay = opts.maxPingDelay || DEFAULTS.maxPingDelay
+    this.bootstrapped = false
+    this.ephemeral = true
+    this.firewalled = true
+    this.destroyed = false
+    this.suspended = false
+    this.online = true
+    this.degraded = false
+    this.stats = {
+      queries: { active: 0, total: 0 },
+      requests: this.io.stats.requests,
+      commands: {
+        ping: this.io.stats.commands[PING],
+        pingNat: this.io.stats.commands[PING_NAT],
+        findNode: this.io.stats.commands[FIND_NODE],
+        downHint: this.io.stats.commands[DOWN_HINT]
+      }
+    }
+
+    this._nat = null
+    this._queryId = randomBytes(32)
+    this._queryK = 20
+  }
+
   static DEFAULTS = DEFAULTS
 
   static bootstrapper(port, host, opts) {
@@ -120,14 +209,17 @@ class DHT extends EventEmitter {
   }
 
   get id() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this.ephemeral ? null : this.table.id
   }
 
   get host() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this._nat.host
   }
 
   get port() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this._nat.port
   }
 
@@ -136,10 +228,21 @@ class DHT extends EventEmitter {
   }
 
   get socket() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this.firewalled ? this.io.clientSocket : this.io.serverSocket
   }
 
   get config() {
+    if (this.outboundPolicy === 'transport-only') {
+      return {
+        concurrency: this.concurrency,
+        maxPingDelay: this.maxPingDelay,
+        outboundPolicy: this.outboundPolicy,
+        requestTimeout: this.requestTimeout,
+        maxTransportCandidates: this.maxTransportCandidates
+      }
+    }
+
     return {
       concurrency: this.concurrency,
       maxWindow: this.io.congestion._maxWindow,
@@ -231,6 +334,7 @@ class DHT extends EventEmitter {
   }
 
   toArray(opts) {
+    if (this.outboundPolicy === 'transport-only') return []
     const limit = opts && opts.limit
     if (limit === 0) return []
     return this.nodes.toArray({ limit, reverse: true }).map(({ host, port }) => ({ host, port }))
@@ -440,6 +544,13 @@ class DHT extends EventEmitter {
   async destroy() {
     const emitClose = !this.destroyed
     this.destroyed = true
+
+    if (this.outboundPolicy === 'transport-only') {
+      await this.io.destroy()
+      if (emitClose) this.emit('close')
+      return
+    }
+
     clearInterval(this._tickInterval)
     for (const timer of this._pendingTimers) {
       clearTimeout(timer)
@@ -1045,6 +1156,32 @@ function randomBytes(n) {
 
 function randomOffset(n) {
   return n - ((Math.random() * 0.5 * n) | 0)
+}
+
+function defaultUDXFactory() {
+  return new UDX()
+}
+
+function validatePolicy(opts) {
+  const policy = opts.outboundPolicy === undefined ? 'direct' : opts.outboundPolicy
+  if (policy !== 'direct' && policy !== 'transport-only') {
+    throw TRANSPORT_INVALID('Unknown outboundPolicy')
+  }
+  return policy
+}
+
+function validatePositiveInteger(value, defaultValue, name) {
+  if (value === undefined) return defaultValue
+  if (!Number.isInteger(value) || value <= 0) throw TRANSPORT_INVALID(`Invalid ${name}`)
+  return value
+}
+
+function validateIntegerRange(value, defaultValue, min, max, name) {
+  if (value === undefined) return defaultValue
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw TRANSPORT_INVALID(`Invalid ${name}`)
+  }
+  return value
 }
 
 function requestAll(dht, internal, command, value, nodes) {
