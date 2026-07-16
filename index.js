@@ -159,7 +159,9 @@ class DHT extends EventEmitter {
     this.udx = null
     this.io = new RequestTransport(opts.requestTransport, {
       requestTimeout: this.requestTimeout,
-      maxTransportCandidates: this.maxTransportCandidates
+      maxTransportCandidates: this.maxTransportCandidates,
+      requestTimer: opts.requestTimer,
+      ontransporterror: (error) => this.emit('transport-error', error)
     })
     this.health = null
 
@@ -186,6 +188,8 @@ class DHT extends EventEmitter {
     this._nat = null
     this._queryId = randomBytes(32)
     this._queryK = 20
+    this._bootstrapping = this._bootstrap()
+    this._bootstrapping.catch(noop)
   }
 
   static DEFAULTS = DEFAULTS
@@ -254,14 +258,23 @@ class DHT extends EventEmitter {
   }
 
   onmessage(socket, buf, rinfo) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (buf.byteLength > 1) this.io.onmessage(socket, buf, rinfo)
   }
 
   bind() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     return this.io.bind()
   }
 
   async suspend({ log = noop } = {}) {
+    if (this.outboundPolicy === 'transport-only') {
+      if (this.destroyed) return
+      await this.io.suspend()
+      this._syncTransportSuspension()
+      return
+    }
+
     log('Suspending waiting for io bind...')
     await this.io.bind()
     log('Done, continuing')
@@ -275,6 +288,13 @@ class DHT extends EventEmitter {
   }
 
   async resume({ log = noop } = {}) {
+    if (this.outboundPolicy === 'transport-only') {
+      if (this.destroyed) return
+      await this.io.resume()
+      this._syncTransportSuspension()
+      return
+    }
+
     if (!this.suspended || this.destroyed) return
     this.suspended = false
     this._tickInterval = setInterval(this._ontick.bind(this), TICK_INTERVAL)
@@ -285,6 +305,12 @@ class DHT extends EventEmitter {
     this.io.networkInterfaces.on('change', (interfaces) => this._onnetworkchange(interfaces))
     this.refresh()
     this.emit('resume')
+  }
+
+  _syncTransportSuspension() {
+    if (this.destroyed || this.suspended === this.io.suspended) return
+    this.suspended = this.io.suspended
+    this.emit(this.suspended ? 'suspend' : 'resume')
   }
 
   address() {
@@ -361,10 +387,17 @@ class DHT extends EventEmitter {
     return new Query(this, target, false, command, value || null, opts)
   }
 
-  ping({ host, port }, opts) {
+  ping(to, opts) {
     let value = null
 
     if (opts && opts.size && opts.size > 0) value = b4a.alloc(opts.size)
+
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      return this._transportRequestToPromise(to, null, true, PING, null, value, opts)
+    }
+
+    const { host, port } = to
 
     const req = this.io.createRequest(
       { id: null, host, port },
@@ -379,13 +412,29 @@ class DHT extends EventEmitter {
     return this._requestToPromise(req, opts)
   }
 
-  delayedPing({ host, port }, delayMs, opts) {
+  delayedPing(to, delayMs, opts) {
     if (delayMs > this.maxPingDelay) {
       throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
     }
 
     const value = b4a.allocUnsafe(4)
     c.uint32.encode({ start: 0, end: 4, buffer: value }, delayMs)
+
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      return this._transportRequestToPromise(
+        to,
+        null,
+        true,
+        DELAYED_PING,
+        null,
+        value,
+        opts,
+        delayMs + 1_000
+      )
+    }
+
+    const { host, port } = to
 
     const req = this.io.createRequest(
       { id: null, host, port },
@@ -449,7 +498,13 @@ class DHT extends EventEmitter {
     return stats
   }
 
-  request({ token = null, command, target = null, value = null }, { host, port }, opts) {
+  request({ token = null, command, target = null, value = null }, to, opts) {
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      return this._transportRequestToPromise(to, token, false, command, target, value, opts)
+    }
+
+    const { host, port } = to
     const req = this.io.createRequest(
       { id: null, host, port },
       token,
@@ -480,10 +535,40 @@ class DHT extends EventEmitter {
     })
   }
 
+  _transportRequestToPromise(to, token, internal, command, target, value, opts, timeout = 0) {
+    let req = null
+    try {
+      req = this.io.createRequest(
+        to,
+        token,
+        internal,
+        command,
+        target,
+        value,
+        (opts && opts.session) || null
+      )
+    } catch (error) {
+      return Promise.reject(error)
+    }
+
+    if (req !== null && timeout > 0) req.timeout = timeout
+    return this._requestToPromise(req, opts)
+  }
+
   async _bootstrap() {
     const self = this
 
     await Promise.resolve() // wait a tick, so apis can be used from the outside
+
+    if (this.outboundPolicy === 'transport-only') {
+      if (this.destroyed) return
+      await this.io.ready()
+      if (this.destroyed) return
+      this.bootstrapped = true
+      this.emit('ready')
+      return
+    }
+
     await this.io.bind()
 
     this.emit('listening')
@@ -559,13 +644,14 @@ class DHT extends EventEmitter {
     if (emitClose) this.emit('close')
   }
 
-  _request(to, force, internal, command, target, value, session, onresponse, onerror) {
+  _request(to, force, internal, command, target, value, session, onresponse, onerror, configure) {
     if (internal && !this._sendDownHints && command === DOWN_HINT) return null
     const req = this.io.createRequest(to, null, internal, command, target, value, session)
     if (req === null) return null
 
     req.onresponse = onresponse
     req.onerror = onerror
+    if (configure) configure(req)
     req.send(force)
 
     return req
@@ -1182,6 +1268,15 @@ function validateIntegerRange(value, defaultValue, min, max, name) {
     throw TRANSPORT_INVALID(`Invalid ${name}`)
   }
   return value
+}
+
+function forbidDirectRequestOptions(opts) {
+  if (!opts) return
+  for (const option of ['socket', 'ttl']) {
+    if (Object.prototype.hasOwnProperty.call(opts, option)) {
+      throw DIRECT_IO_FORBIDDEN(`${option} is unavailable with transport-only`)
+    }
+  }
 }
 
 function requestAll(dht, internal, command, value, nodes) {

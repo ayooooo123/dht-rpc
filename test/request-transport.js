@@ -154,13 +154,14 @@ test('transport-only construction has no direct network state', (t) => {
     '_refreshTicks',
     '_stableTicks',
     '_nonePersistentSamples',
-    '_bootstrapping',
     '_sendDownHints',
     '_downHintsRateLimit',
     '_downHintsSentPerTick'
   ]) {
     t.is(field in dht, false, `${field} is not initialized`)
   }
+
+  t.ok(dht._bootstrapping && typeof dht._bootstrapping.then === 'function')
 })
 
 test('transport-only defaults routed request limits', (t) => {
@@ -355,6 +356,1070 @@ test('transport-only rejects direct constructor options', async (t) => {
   }
 })
 
+test('transport-only request preserves opaque authority and normalizes replies', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const to = transport.destinations[0]
+  const from = transport.destinations[1]
+  const target = b4a.alloc(32, 3)
+  const value = b4a.from('hello')
+  const token = b4a.alloc(32, 4)
+  let settled = false
+
+  const result = dht.request({ token, command: 7, target, value }, to).then((reply) => {
+    settled = true
+    return reply
+  })
+
+  t.is(settled, false, 'does not settle in send stack')
+  await tick()
+  t.alike(transport.calls.request[0][0], {
+    to,
+    token,
+    internal: false,
+    command: 7,
+    target,
+    value,
+    attempt: 1
+  })
+  t.is('host' in transport.calls.request[0][0], false)
+  t.is('port' in transport.calls.request[0][0], false)
+  t.is('socket' in transport.calls.request[0][0], false)
+  t.is('ttl' in transport.calls.request[0][0], false)
+  t.alike(dht.stats.requests, {
+    active: 1,
+    total: 1,
+    responses: 0,
+    timeouts: 0,
+    retries: 0
+  })
+
+  transport.requests[0].resolve({ from, error: 0, rtt: 12 })
+  const reply = await result
+
+  t.is(reply.from, from, 'preserves opaque from')
+  t.is(reply.to, null)
+  t.is(reply.token, null)
+  t.is(reply.closerNodes, null)
+  t.is(reply.value, null)
+  t.alike(dht.stats.requests, {
+    active: 0,
+    total: 1,
+    responses: 1,
+    timeouts: 0,
+    retries: 0
+  })
+  t.is(dht.io._destinationRegistry.size, 0, 'clears standalone registry')
+  t.is(dht.io._responseRegistries, 0, 'disposes response registry')
+
+  await dht.destroy()
+})
+
+test('transport-only ping variants preserve opaque destinations', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const to = transport.destinations[0]
+
+  const ping = dht.ping(to)
+  await tick()
+  t.is(transport.calls.request[0][0].to, to)
+  transport.requests[0].resolve(validReply(transport.destinations[1]))
+  await ping
+
+  const delayed = dht.delayedPing(to, 5)
+  await tick()
+  t.is(transport.calls.request[1][0].to, to)
+  transport.requests[1].resolve(validReply(transport.destinations[1]))
+  await delayed
+
+  await dht.destroy()
+})
+
+test('transport-only validates standalone destinations before adapter request', async (t) => {
+  for (const override of [
+    { key: () => 1 },
+    {
+      key: () => {
+        throw new Error('key failed')
+      }
+    },
+    { id: () => b4a.alloc(31) },
+    {
+      id: () => {
+        throw new Error('id failed')
+      }
+    }
+  ]) {
+    const transport = createTransport(override)
+    const dht = createTransportDHT(transport)
+    const error = await promiseError(
+      dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+    )
+
+    t.is(error && error.code, 'TRANSPORT_INVALID')
+    t.is(transport.calls.request.length, 0)
+    t.is(dht.io._destinationRegistry.size, 0)
+    await dht.destroy()
+  }
+})
+
+test('transport-only normalizes hostile caller destination ids', async (t) => {
+  for (const [name, id] of hostileIds()) {
+    const transport = createTransport({ id: () => id })
+    const dht = createTransportDHT(transport)
+    const error = await promiseError(
+      dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+    )
+
+    t.is(error && error.code, 'TRANSPORT_INVALID', name)
+    t.is(transport.calls.request.length, 0, `${name} request`)
+    t.is(dht.stats.requests.active, 0, `${name} active`)
+    t.is(dht.io._destinationRegistry.size, 0, `${name} registry`)
+    await dht.destroy()
+  }
+})
+
+test('transport-only rejects caller ids whose copy shrinks', async (t) => {
+  const transport = createTransport()
+  transport.destinations[0].id = shrinkingId()
+  const dht = createTransportDHT(transport)
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  if (transport.requests[0]) {
+    transport.requests[0].resolve(validReply(transport.destinations[1]))
+  }
+  const error = await promiseError(result)
+
+  t.is(error && error.code, 'TRANSPORT_INVALID')
+  t.is(transport.calls.request.length, 0)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only rejects malformed adapter operations without retry', async (t) => {
+  for (const operation of [null, {}, { promise: Promise.resolve(), cancel: null }]) {
+    const transport = createTransport({ request: () => operation })
+    const dht = createTransportDHT(transport)
+    const error = await promiseError(dht.request({ command: 7 }, transport.destinations[0]))
+
+    t.is(error && error.code, 'TRANSPORT_INVALID')
+    t.is(dht.stats.requests.retries, 0)
+    t.is(dht.stats.requests.active, 0)
+    t.is(dht.io._destinationRegistry.size, 0)
+    await dht.destroy()
+  }
+})
+
+test('transport-only captures thenable authority once', async (t) => {
+  const transport = createTransport()
+  let reads = 0
+  let calls = 0
+  let receiver = null
+  const thenable = {}
+  Object.defineProperty(thenable, 'then', {
+    get() {
+      reads++
+      if (reads > 1) throw new Error('then authority reread')
+      return function (resolve) {
+        calls++
+        receiver = this
+        resolve(validReply(transport.destinations[1]))
+      }
+    }
+  })
+  transport.request = (message) => {
+    transport.calls.request.push([message])
+    return { promise: thenable, cancel() {} }
+  }
+  const dht = createTransportDHT(transport)
+  const outcome = await dht
+    .request({ command: 7 }, transport.destinations[0], { retry: false })
+    .then(
+      (reply) => ({ reply, error: null }),
+      (error) => ({ reply: null, error })
+    )
+
+  t.is(outcome.error, null)
+  if (outcome.reply) t.is(outcome.reply.from, transport.destinations[1])
+  t.is(reads, 1)
+  t.is(calls, 1)
+  t.is(receiver, thenable)
+  t.is(transport.calls.request.length, 1)
+  t.is(dht.stats.requests.retries, 0)
+  t.is(dht.stats.requests.active, 0)
+  await dht.destroy()
+})
+
+test('transport-only rejects invalid first then authority without retry', async (t) => {
+  const cases = [
+    { get: () => 1 },
+    {
+      get() {
+        throw new Error('then getter failed')
+      }
+    }
+  ]
+
+  for (const descriptor of cases) {
+    const thenable = {}
+    Object.defineProperty(thenable, 'then', descriptor)
+    const transport = createTransport({
+      request: () => ({ promise: thenable, cancel() {} })
+    })
+    const dht = createTransportDHT(transport)
+    const error = await promiseError(
+      dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+    )
+
+    t.is(error && error.code, 'TRANSPORT_INVALID')
+    t.is(dht.stats.requests.retries, 0)
+    t.is(dht.stats.requests.active, 0)
+    await dht.destroy()
+  }
+})
+
+test('transport-only validates each response atomically', async (t) => {
+  const cases = [
+    { reply: null },
+    { reply: { from: { route: 'bad' }, error: -1, rtt: 1 } },
+    { reply: { from: { route: 'bad' }, error: 0, rtt: -1 } },
+    { reply: { from: { route: 'bad' }, error: 0.5, rtt: 1 } },
+    { reply: { from: { route: 'bad' }, error: 0, rtt: 1.5 } },
+    {
+      reply: {
+        from: { route: 'from', id: b4a.alloc(32, 8) },
+        error: 0,
+        rtt: 1,
+        closerNodes: new Array(21).fill({ route: 'closer', id: b4a.alloc(32, 9) })
+      }
+    }
+  ]
+
+  for (const { reply } of cases) {
+    const transport = createTransport()
+    const dht = createTransportDHT(transport)
+    const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+    await tick()
+    transport.requests[0].resolve(reply)
+    const error = await promiseError(result)
+
+    t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+    t.is(dht.stats.requests.active, 0)
+    t.is(dht.stats.requests.responses, 0)
+    t.is(dht.io._destinationRegistry.size, 0)
+    t.is(dht.io._responseRegistries, 0)
+    await dht.destroy()
+  }
+})
+
+test('transport-only maps throwing reply accessors to invalid response', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  transport.requests[0].resolve(
+    new Proxy(validReply(transport.destinations[1]), {
+      get(target, property, receiver) {
+        if (property === 'error') throw new Error('hostile getter')
+        return Reflect.get(target, property, receiver)
+      }
+    })
+  )
+
+  const error = await promiseError(result)
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only normalizes hostile reply destination ids', async (t) => {
+  for (const [name, id] of hostileIds()) {
+    for (const placement of ['from', 'closer']) {
+      const transport = createTransport()
+      const dht = createTransportDHT(transport)
+      const hostile = { route: `${name}-${placement}`, id }
+      const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+      await tick()
+      transport.requests[0].resolve(
+        validReply(placement === 'from' ? hostile : transport.destinations[1], {
+          closerNodes: placement === 'closer' ? [hostile] : null
+        })
+      )
+      const error = await promiseError(result)
+
+      t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE', `${name} ${placement}`)
+      t.is(dht.stats.requests.active, 0, `${name} ${placement} active`)
+      t.is(dht.io._destinationRegistry.size, 0, `${name} ${placement} registry`)
+      t.is(dht.io._responseRegistries, 0, `${name} ${placement} response registry`)
+      await dht.destroy()
+    }
+  }
+})
+
+test('transport-only rejects reply ids whose copy shrinks', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  transport.requests[0].resolve(validReply({ route: 'shrinking', id: shrinkingId() }))
+  const error = await promiseError(result)
+
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.stats.requests.responses, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  t.is(dht.io._responseRegistries, 0)
+  await dht.destroy()
+})
+
+test('transport-only snapshots every logical reply field once', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const validFrom = transport.destinations[1]
+  const accesses = new Map()
+  const values = {
+    rtt: 1,
+    from: validFrom,
+    to: { local: true },
+    token: b4a.alloc(32, 7),
+    closerNodes: null,
+    error: 0,
+    value: b4a.from('snapshot')
+  }
+  const reply = {}
+
+  for (const field of Object.keys(values)) {
+    Object.defineProperty(reply, field, {
+      enumerable: true,
+      get() {
+        const count = (accesses.get(field) || 0) + 1
+        accesses.set(field, count)
+        if (field === 'from' && count > 1) return { route: 'invalid' }
+        return values[field]
+      }
+    })
+  }
+
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  transport.requests[0].resolve(reply)
+  const outcome = await result.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  )
+
+  t.is(outcome.error, null)
+  if (outcome.value) t.is(outcome.value.from, validFrom)
+  for (const field of Object.keys(values)) t.is(accesses.get(field), 1, field)
+  await dht.destroy()
+})
+
+test('transport-only maps throwing closer length to invalid response', async (t) => {
+  const closerNodes = new Proxy([], {
+    get(target, property, receiver) {
+      if (property === 'length') throw new Error('hostile length')
+      return Reflect.get(target, property, receiver)
+    }
+  })
+  const { dht, error } = await invalidCloserReply(closerNodes)
+
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only maps throwing closer index to invalid response', async (t) => {
+  const closerNodes = new Proxy([{ route: 'closer', id: b4a.alloc(32, 9) }], {
+    get(target, property, receiver) {
+      if (property === '0') throw new Error('hostile index')
+      return Reflect.get(target, property, receiver)
+    }
+  })
+  const { dht, error } = await invalidCloserReply(closerNodes)
+
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only snapshots closer indexes without iterator authority', async (t) => {
+  const transport = createTransport()
+  const closer = transport.destinations[0]
+  let lengths = 0
+  let indexes = 0
+  let iterators = 0
+  const closerNodes = new Proxy([closer], {
+    get(target, property, receiver) {
+      if (property === 'length') lengths++
+      if (property === '0') indexes++
+      if (property === Symbol.iterator) {
+        iterators++
+        throw new Error('iterator must not be consulted')
+      }
+      return Reflect.get(target, property, receiver)
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  transport.requests[0].resolve(
+    validReply(transport.destinations[1], {
+      closerNodes
+    })
+  )
+  const outcome = await result.then(
+    (value) => ({ value, error: null }),
+    (error) => ({ value: null, error })
+  )
+
+  t.is(outcome.error, null)
+  if (outcome.value) {
+    t.is(Array.isArray(outcome.value.closerNodes), true)
+    t.is(outcome.value.closerNodes === closerNodes, false)
+    t.is(outcome.value.closerNodes[0], closer)
+  }
+  t.is(lengths, 1)
+  t.is(indexes, 1)
+  t.is(iterators, 0)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only rejects response key collisions and retained-to conflicts', async (t) => {
+  const to = { route: 'to', id: b4a.alloc(32, 1) }
+  const from = { route: 'from', id: b4a.alloc(32, 2) }
+  const conflict = { route: 'conflict', id: b4a.alloc(32, 3) }
+  const transport = createTransport({
+    key(destination) {
+      transport.calls.key.push([destination])
+      return destination === to || destination === conflict ? 'same' : 'from'
+    },
+    id(destination) {
+      transport.calls.id.push([destination])
+      return destination.id
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const result = dht.request({ command: 7 }, to, { retry: false })
+  await tick()
+  transport.requests[0].resolve({
+    from,
+    closerNodes: [conflict],
+    error: 0,
+    rtt: 1
+  })
+
+  const error = await promiseError(result)
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only retries deterministically and cancels before retry', async (t) => {
+  const timer = manualTimer()
+  const events = []
+  const transport = createTransport({
+    request(message) {
+      events.push(`request:${message.attempt}`)
+      transport.calls.request.push([message])
+      const pending = deferred()
+      transport.requests.push(pending)
+      return {
+        promise: pending.promise,
+        cancel(reason) {
+          events.push(`cancel:${message.attempt}`)
+          transport.calls.cancel.push([reason])
+        }
+      }
+    }
+  })
+  const dht = createTransportDHT(transport, { requestTimer: timer, requestTimeout: 1_000 })
+  const req = dht._request(
+    transport.destinations[0],
+    false,
+    false,
+    7,
+    null,
+    null,
+    null,
+    () => events.push('response'),
+    () => events.push('error')
+  )
+  req.retries = 1
+  req.oncycle = () => events.push(`cycle:${req.sent}`)
+  await tick()
+
+  timer.advance(1_000)
+  await tick()
+  t.alike(events, ['request:1', 'cycle:1', 'cancel:1', 'request:2'])
+  t.alike(
+    transport.calls.request.map(([message]) => message.attempt),
+    [1, 2]
+  )
+  t.is(transport.calls.cancel[0][0].code, 'REQUEST_TIMEOUT')
+  t.alike(dht.stats.requests, {
+    active: 1,
+    total: 1,
+    responses: 0,
+    timeouts: 0,
+    retries: 1
+  })
+
+  timer.advance(1_000)
+  await tick()
+  t.alike(events, ['request:1', 'cycle:1', 'cancel:1', 'request:2', 'cycle:2', 'cancel:2', 'error'])
+  t.alike(dht.stats.requests, {
+    active: 0,
+    total: 1,
+    responses: 0,
+    timeouts: 1,
+    retries: 1
+  })
+  t.is(dht.io._destinationRegistry.size, 0)
+
+  await dht.destroy()
+})
+
+test('transport-only retry false performs one timeout attempt', async (t) => {
+  const timer = manualTimer()
+  const transport = createTransport()
+  const dht = createTransportDHT(transport, { requestTimer: timer })
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  timer.advance(1_000)
+  const error = await promiseError(result)
+
+  t.is(error && error.code, 'REQUEST_TIMEOUT')
+  t.is(transport.calls.request.length, 1)
+  t.is(transport.calls.cancel.length, 1)
+  t.is(dht.stats.requests.timeouts, 1)
+  await dht.destroy()
+})
+
+test('transport-only cancels a valid operation when timer set throws', async (t) => {
+  const setError = new Error('set failed')
+  const timer = {
+    set() {
+      throw setError
+    },
+    clear() {
+      throw new Error('must not clear an unset timer')
+    }
+  }
+  const transport = createTransport()
+  const dht = createTransportDHT(transport, { requestTimer: timer })
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  const error = await promiseError(result)
+
+  t.is(error && error.code, 'TRANSPORT_INVALID')
+  t.is(error && error.cause, setError)
+  t.is(transport.calls.cancel.length, 1)
+  if (transport.calls.cancel.length > 0) t.is(transport.calls.cancel[0][0], error)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  transport.requests[0].resolve(validReply(transport.destinations[1]))
+  await tick()
+  t.is(dht.stats.requests.responses, 0, 'late response ignored')
+  await dht.destroy()
+})
+
+test('transport-only timer clear failure is terminal on reply', async (t) => {
+  const clearError = new Error('clear failed')
+  const timer = throwingClearTimer(clearError)
+  const transport = createTransport()
+  const dht = createTransportDHT(transport, { requestTimer: timer })
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  transport.requests[0].resolve(validReply(transport.destinations[1]))
+  const error = await promiseError(result)
+
+  t.is(error && error.code, 'TRANSPORT_INVALID')
+  t.is(error && error.cause, clearError)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.stats.requests.responses, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only timeout wins over timer clear failure', async (t) => {
+  const clearError = new Error('clear failed')
+  const timer = throwingClearTimer(clearError)
+  const transport = createTransport()
+  const dht = createTransportDHT(transport, { requestTimer: timer })
+  const emitted = []
+  dht.on('transport-error', (error) => emitted.push(error))
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  timer.fire()
+  const error = await promiseError(result)
+  await tick()
+
+  t.is(error && error.code, 'REQUEST_TIMEOUT')
+  t.is(transport.calls.cancel.length, 1)
+  t.is(emitted.length, 1)
+  t.is(emitted[0].code, 'TRANSPORT_INVALID')
+  t.is(emitted[0].cause, clearError)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only lifecycle error wins over timer clear failure', async (t) => {
+  for (const [name, terminate, code] of [
+    ['session', (dht, session, error) => session.destroy(error), null],
+    ['suspend', (dht) => dht.suspend(), 'IO_SUSPENDED'],
+    ['destroy', (dht) => dht.destroy(), 'REQUEST_DESTROYED']
+  ]) {
+    const clearError = new Error(`${name} clear failed`)
+    const timer = throwingClearTimer(clearError)
+    const transport = createTransport()
+    const dht = createTransportDHT(transport, { requestTimer: timer })
+    const session = dht.session()
+    const custom = new Error('session terminal')
+    const emitted = []
+    dht.on('transport-error', (error) => emitted.push(error))
+    const result = dht.request({ command: 7 }, transport.destinations[0], { session, retry: false })
+    await tick()
+    await terminate(dht, session, custom)
+    const error = await promiseError(result)
+    await tick()
+
+    if (code === null) t.is(error, custom, name)
+    else t.is(error && error.code, code, name)
+    t.is(transport.calls.cancel.length, 1)
+    t.is(emitted.length, 1)
+    t.is(emitted[0].code, 'TRANSPORT_INVALID')
+    t.is(emitted[0].cause, clearError)
+    t.is(dht.stats.requests.active, 0)
+    t.is(dht.io._destinationRegistry.size, 0)
+    transport.requests[0].reject(new Error('late rejection'))
+    await tick()
+    if (!dht.destroyed) await dht.destroy()
+  }
+})
+
+test('transport-only retries synchronous throws and rejects asynchronously', async (t) => {
+  let calls = 0
+  let synchronous = true
+  const transport = createTransport({
+    request() {
+      calls++
+      throw new Error('offline')
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const result = dht
+    .request({ command: 7 }, transport.destinations[0], { retry: false })
+    .catch((error) => {
+      t.is(synchronous, false)
+      return error
+    })
+  synchronous = false
+  const error = await result
+
+  t.is(calls, 1)
+  t.is(error.code, 'TRANSPORT_UNAVAILABLE')
+  t.is(error.cause && error.cause.message, 'offline')
+  t.is(dht.io._destinationRegistry.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only session destroy cancels and ignores late settlement', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const session = dht.session()
+  const custom = new Error('session closed')
+  const result = dht.request({ command: 7 }, transport.destinations[0], { session, retry: false })
+  await tick()
+
+  session.destroy(custom)
+  const error = await promiseError(result)
+  t.is(error, custom)
+  t.is(transport.calls.cancel.length, 1)
+  t.is(transport.calls.cancel[0][0], custom)
+  t.is(session.inflight.length, 0)
+  t.is(dht.stats.requests.active, 0)
+
+  transport.requests[0].resolve(validReply(transport.destinations[1]))
+  await tick()
+  t.is(dht.stats.requests.responses, 0)
+  t.is(dht.stats.requests.active, 0)
+  await dht.destroy()
+})
+
+test('transport-only session request and ping preserve opaque destinations', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const session = dht.session()
+  const to = transport.destinations[0]
+
+  const request = session.request({ command: 7 }, to, { retry: false })
+  await tick()
+  t.is(transport.calls.request[0][0].to, to)
+  transport.requests[0].resolve(validReply(transport.destinations[1]))
+  await request
+
+  const ping = session.ping(to, { retry: false })
+  await tick()
+  t.is(transport.calls.request[1][0].to, to)
+  transport.requests[1].resolve(validReply(transport.destinations[1]))
+  await ping
+
+  await dht.destroy()
+})
+
+test('transport-only suspend resume and destroy are ordered and idempotent', async (t) => {
+  const events = []
+  const transport = createTransport({
+    ready() {
+      events.push('ready')
+      return Promise.resolve()
+    },
+    suspend() {
+      events.push('suspend')
+      return Promise.resolve()
+    },
+    resume() {
+      events.push('resume')
+      return Promise.resolve()
+    },
+    destroy() {
+      events.push('destroy')
+      return Promise.resolve()
+    }
+  })
+  const dht = createTransportDHT(transport)
+  let listening = 0
+  let ready = 0
+  dht.on('listening', () => listening++)
+  dht.on('ready', () => ready++)
+  await dht.fullyBootstrapped()
+  t.alike(events, ['ready'])
+  t.is(ready, 1)
+  t.is(listening, 0)
+
+  const active = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  await Promise.all([dht.suspend(), dht.suspend()])
+  const suspendError = await promiseError(active)
+  t.is(suspendError && suspendError.code, 'IO_SUSPENDED')
+  t.is(transport.calls.cancel.length, 1)
+  t.is(transport.calls.cancel[0][0].code, 'IO_SUSPENDED')
+  t.alike(events, ['ready', 'suspend'])
+
+  await Promise.all([dht.resume(), dht.resume()])
+  t.alike(events, ['ready', 'suspend', 'resume'])
+
+  const activeOnDestroy = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  await Promise.all([dht.destroy(), dht.destroy()])
+  const destroyError = await promiseError(activeOnDestroy)
+  t.is(destroyError && destroyError.code, 'REQUEST_DESTROYED')
+  t.is(transport.calls.cancel[1][0].code, 'REQUEST_DESTROYED')
+  t.alike(events, ['ready', 'suspend', 'resume', 'destroy'])
+})
+
+test('transport-only retries suspend after failure without changing actual state', async (t) => {
+  const failures = [new Error('first suspend failed'), new Error('second suspend failed')]
+  let suspends = 0
+  const transport = createTransport({
+    suspend() {
+      return Promise.reject(failures[suspends++])
+    }
+  })
+  const dht = createTransportDHT(transport)
+  await dht.fullyBootstrapped()
+
+  for (let i = 0; i < failures.length; i++) {
+    const error = await promiseError(dht.suspend())
+    t.is(error && error.code, 'TRANSPORT_UNAVAILABLE', `failure ${i + 1}`)
+    t.is(error && error.cause, failures[i], `cause ${i + 1}`)
+    t.is(dht.suspended, false, `DHT actual ${i + 1}`)
+    t.is(dht.io.suspended, false, `transport actual ${i + 1}`)
+  }
+
+  t.is(suspends, 2)
+  const requestError = promiseError(
+    dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  )
+  await tick()
+  t.is(transport.calls.request.length, 1)
+  if (transport.requests[0]) {
+    transport.requests[0].resolve(validReply(transport.destinations[1]))
+  }
+  t.is(await requestError, null)
+  await dht.destroy()
+})
+
+test('transport-only queues suspend requested during resume', async (t) => {
+  const lifecycle = []
+  const emitted = []
+  const resume = deferred()
+  const transport = createTransport({
+    ready() {
+      lifecycle.push('ready')
+      return Promise.resolve()
+    },
+    suspend() {
+      lifecycle.push('suspend')
+      return Promise.resolve()
+    },
+    resume() {
+      lifecycle.push('resume')
+      return resume.promise
+    }
+  })
+  const dht = createTransportDHT(transport)
+  dht.on('suspend', () => emitted.push('suspend'))
+  dht.on('resume', () => emitted.push('resume'))
+  await dht.fullyBootstrapped()
+  await dht.suspend()
+
+  const resuming = dht.resume()
+  await tick()
+  const suspending = dht.suspend()
+  t.alike(lifecycle, ['ready', 'suspend', 'resume'])
+  t.is(dht.suspended, true)
+  t.is(dht.io.suspended, true)
+
+  resume.resolve()
+  await Promise.all([resuming, suspending])
+
+  t.alike(lifecycle, ['ready', 'suspend', 'resume', 'suspend'])
+  t.alike(emitted, ['suspend', 'resume', 'suspend'])
+  t.is(dht.suspended, true)
+  t.is(dht.io.suspended, true)
+  await dht.destroy()
+})
+
+test('transport-only maps lifecycle failures and preserves cancel outcomes', async (t) => {
+  for (const [method, invoke] of [
+    ['ready', (dht) => dht.fullyBootstrapped()],
+    ['suspend', (dht) => dht.suspend()],
+    [
+      'resume',
+      async (dht) => {
+        await dht.suspend()
+        return dht.resume()
+      }
+    ],
+    ['destroy', (dht) => dht.destroy()]
+  ]) {
+    const original = new Error(`${method} failed`)
+    const transport = createTransport({ [method]: () => Promise.reject(original) })
+    const dht = createTransportDHT(transport)
+    if (method !== 'ready') await dht.fullyBootstrapped()
+    const error = await promiseError(invoke(dht))
+
+    t.is(error && error.code, 'TRANSPORT_UNAVAILABLE', method)
+    t.is(error && error.cause, original, `${method} cause`)
+    if (method !== 'destroy') {
+      transport.destroy = () => Promise.resolve()
+      await dht.destroy()
+    }
+  }
+
+  const timer = manualTimer()
+  const cancelError = new Error('cancel failed')
+  const transport = createTransport({
+    request(message) {
+      transport.calls.request.push([message])
+      return {
+        promise: new Promise(() => {}),
+        cancel: () => {
+          throw cancelError
+        }
+      }
+    }
+  })
+  const dht = createTransportDHT(transport, { requestTimer: timer })
+  const emitted = []
+  dht.on('transport-error', (error) => emitted.push(error))
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  timer.advance(1_000)
+  const error = await promiseError(result)
+
+  t.is(error && error.code, 'REQUEST_TIMEOUT')
+  t.is(emitted.length, 1)
+  t.is(emitted[0].code, 'TRANSPORT_UNAVAILABLE')
+  t.is(emitted[0].cause, cancelError)
+  await dht.destroy()
+})
+
+test('transport-only rejects direct request authority before adapter activity', async (t) => {
+  for (const [method, args] of [
+    ['request', [{ command: 7 }, { route: 'a', id: b4a.alloc(32) }, { socket: {} }]],
+    ['request', [{ command: 7 }, { route: 'a', id: b4a.alloc(32) }, { ttl: 1 }]],
+    ['ping', [{ route: 'a', id: b4a.alloc(32) }, { ttl: 1 }]],
+    ['delayedPing', [{ route: 'a', id: b4a.alloc(32) }, 1, { ttl: 1 }]]
+  ]) {
+    const transport = createTransport()
+    const dht = createTransportDHT(transport)
+    const error = await callError(() => dht[method](...args))
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+    t.is(transport.calls.request.length, 0)
+    await dht.destroy()
+  }
+})
+
+test('transport-only rejects direct packet entrypoints before adapter activity', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+
+  for (const invoke of [
+    () => dht.bind(),
+    () => dht.onmessage({}, b4a.from([1, 2]), { host: '127.0.0.1', port: 1 })
+  ]) {
+    const error = syncError(invoke)
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  }
+
+  for (const calls of Object.values(transport.calls)) {
+    if (calls === transport.calls.ready) continue
+    t.is(calls.length, 0)
+  }
+  await dht.destroy()
+})
+
+test('constructor validates transport request timer', async (t) => {
+  for (const requestTimer of [null, {}, { set() {}, clear: null }]) {
+    await constructorError(
+      t,
+      {
+        outboundPolicy: 'transport-only',
+        requestTransport: createTransport(),
+        requestTimer
+      },
+      'TRANSPORT_INVALID'
+    )
+  }
+})
+
+test('direct session destruction releases real congestion for subsequent requests', async (t) => {
+  const dht = new DHT({ bootstrap: false, host: '127.0.0.1' })
+  await dht.io.bind()
+
+  const firstSession = dht.session()
+  const firstError = new Error('first closed')
+  const firstResult = promiseError(
+    firstSession.request({ command: 7 }, { host: '127.0.0.1', port: 1 }, { retry: false })
+  )
+
+  t.is(firstSession.inflight.length, 1)
+  t.is(dht.io.inflight.length, 1)
+  t.is(dht.io.inflight[0].sent, 1)
+  t.is(dht.io.congestion._total, 1)
+  t.is(dht.stats.requests.active, 1)
+  firstSession.destroy(firstError)
+  t.is(await firstResult, firstError)
+  t.is(firstSession.inflight.length, 0)
+  t.is(dht.io.inflight.length, 0)
+  t.is(dht.io.congestion._total, 0)
+  t.is(dht.stats.requests.active, 0)
+
+  const secondSession = dht.session()
+  const secondError = new Error('second closed')
+  const secondResult = promiseError(
+    secondSession.request({ command: 7 }, { host: '127.0.0.1', port: 1 }, { retry: false })
+  )
+  t.is(secondSession.inflight.length, 1)
+  t.is(dht.io.inflight[0].sent, 1, 'subsequent request sends immediately')
+  t.is(dht.io.congestion._total, 1)
+  secondSession.destroy(secondError)
+  t.is(await secondResult, secondError)
+  t.is(dht.io.congestion._total, 0)
+  t.is(dht.stats.requests.active, 0)
+
+  await dht.destroy()
+})
+
+test('direct request installs callbacks before send', (t) => {
+  const onresponse = () => {}
+  const onerror = () => {}
+  const req = {
+    onresponse: null,
+    onerror: null,
+    send(force) {
+      t.is(this.onresponse, onresponse)
+      t.is(this.onerror, onerror)
+      t.is(force, true)
+    }
+  }
+  const dht = Object.create(DHT.prototype)
+  dht._sendDownHints = true
+  dht.io = { createRequest: () => req }
+
+  t.is(dht._request({}, true, false, 7, null, null, null, onresponse, onerror), req)
+})
+
+test('request configuration runs before first send', (t) => {
+  const oncycle = () => {}
+  const req = {
+    retries: 3,
+    oncycle: null,
+    send() {
+      t.is(this.retries, 7)
+      t.is(this.oncycle, oncycle)
+    }
+  }
+  const dht = Object.create(DHT.prototype)
+  dht._sendDownHints = true
+  dht.io = { createRequest: () => req }
+
+  dht._request(
+    {},
+    false,
+    false,
+    7,
+    null,
+    null,
+    null,
+    () => {},
+    () => {},
+    (request) => {
+      request.retries = 7
+      request.oncycle = oncycle
+    }
+  )
+})
+
+test('query configures retries and cycles before DHT sends', (t) => {
+  const Query = require('../lib/query')
+  const query = Object.create(Query.prototype)
+  const req = { retries: 3, oncycle: null }
+  let configure = null
+  query.inflight = 0
+  query.force = true
+  query.internal = false
+  query.command = 7
+  query.target = b4a.alloc(32)
+  query.value = null
+  query.retries = 5
+  query._session = null
+  query._onvisitbound = () => {}
+  query._onerrorbound = () => {}
+  query._oncyclebound = () => {}
+  query.dht = {
+    _request(...args) {
+      configure = args[9]
+      return req
+    }
+  }
+
+  query._visit({ host: '127.0.0.1', port: 1 })
+  t.is(typeof configure, 'function')
+  if (configure) configure(req)
+  t.is(req.retries, 0, 'force disables retries before send')
+  t.is(req.oncycle, query._oncyclebound)
+})
+
 function createTransport(overrides = {}) {
   const calls = {
     ready: [],
@@ -435,6 +1500,147 @@ function deferred() {
   })
 
   return { promise, resolve, reject }
+}
+
+function createTransportDHT(transport, opts = {}) {
+  return new DHT({
+    outboundPolicy: 'transport-only',
+    requestTransport: transport,
+    ...opts
+  })
+}
+
+function validReply(from, overrides = {}) {
+  return { from, error: 0, rtt: 1, ...overrides }
+}
+
+function hostileIds() {
+  return [
+    [
+      'byteLength',
+      new Proxy(b4a.alloc(32), {
+        get(target, property) {
+          if (property === 'byteLength') throw new Error('hostile byteLength')
+          return Reflect.get(target, property, target)
+        }
+      })
+    ],
+    [
+      'copy',
+      new Proxy(b4a.alloc(32), {
+        get(target, property) {
+          if (property === 'length') throw new Error('hostile copy')
+          return Reflect.get(target, property, target)
+        }
+      })
+    ]
+  ]
+}
+
+function shrinkingId() {
+  let byteLengths = 0
+  return new Proxy(b4a.alloc(32), {
+    get(target, property) {
+      if (property === 'byteLength') return ++byteLengths === 1 ? 32 : 31
+      if (property === 'length') return 31
+      return Reflect.get(target, property, target)
+    }
+  })
+}
+
+async function invalidCloserReply(closerNodes) {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  transport.requests[0].resolve(
+    validReply(transport.destinations[1], {
+      closerNodes
+    })
+  )
+  return { dht, error: await promiseError(result) }
+}
+
+function manualTimer() {
+  let now = 0
+  let next = 0
+  const pending = new Map()
+
+  return {
+    set(fn, ms) {
+      const handle = { id: next++, at: now + ms, fn }
+      pending.set(handle.id, handle)
+      return handle
+    },
+    clear(handle) {
+      if (handle) pending.delete(handle.id)
+    },
+    advance(ms) {
+      now += ms
+      const due = [...pending.values()]
+        .filter((handle) => handle.at <= now)
+        .sort((a, b) => a.at - b.at || a.id - b.id)
+      for (const handle of due) {
+        if (!pending.delete(handle.id)) continue
+        handle.fn()
+      }
+    }
+  }
+}
+
+function throwingClearTimer(error) {
+  let callback = null
+  let handle = null
+
+  return {
+    set(fn) {
+      callback = fn
+      handle = {}
+      return handle
+    },
+    clear(candidate) {
+      tSame(candidate, handle)
+      throw error
+    },
+    fire() {
+      callback()
+    }
+  }
+}
+
+function tSame(actual, expected) {
+  if (actual !== expected) throw new Error('unexpected timer handle')
+}
+
+async function promiseError(promise) {
+  try {
+    await promise
+    return null
+  } catch (error) {
+    return error
+  }
+}
+
+async function callError(fn) {
+  try {
+    await fn()
+    return null
+  } catch (error) {
+    return error
+  }
+}
+
+function syncError(fn) {
+  try {
+    fn()
+    return null
+  } catch (error) {
+    return error
+  }
+}
+
+function tick() {
+  return Promise.resolve().then(() => Promise.resolve())
 }
 
 async function constructorError(t, opts, code, message) {
