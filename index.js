@@ -16,7 +16,8 @@ const {
   UNKNOWN_COMMAND,
   INVALID_TOKEN,
   DIRECT_IO_FORBIDDEN,
-  TRANSPORT_INVALID
+  TRANSPORT_INVALID,
+  TRANSPORT_INVALID_RESPONSE
 } = require('./lib/errors')
 const { PING, PING_NAT, FIND_NODE, DOWN_HINT, DELAYED_PING } = require('./lib/commands')
 
@@ -377,17 +378,112 @@ class DHT extends EventEmitter {
 
   findNode(target, opts) {
     if (this.destroyed) throw new Error('Node destroyed')
-    this._refreshTicks = REFRESH_TICKS
+    if (opts && opts.session && opts.session.destroyed) throw opts.session.error
+    if (this.outboundPolicy === 'direct') this._refreshTicks = REFRESH_TICKS
     return new Query(this, target, true, FIND_NODE, null, opts)
   }
 
   query({ target, command, value }, opts) {
     if (this.destroyed) throw new Error('Node destroyed')
-    this._refreshTicks = REFRESH_TICKS
+    if (opts && opts.session && opts.session.destroyed) throw opts.session.error
+    if (this.outboundPolicy === 'direct') this._refreshTicks = REFRESH_TICKS
     return new Query(this, target, false, command, value || null, opts)
   }
 
+  _nodeKey(node) {
+    return node.key
+  }
+
+  _nodeId(node) {
+    return node.id
+  }
+
+  _queryCandidate(destination, registry, added = null) {
+    if (this.outboundPolicy === 'direct') {
+      const sourceId = destination.id || peer.id(destination.host, destination.port)
+      const { id, destinationId } = copyDirectIds(sourceId)
+      const directDestination = Object.freeze({
+        id: destinationId,
+        host: destination.host,
+        port: destination.port
+      })
+      return Object.freeze({
+        destination: directDestination,
+        key: destination.host + ':' + destination.port,
+        id
+      })
+    }
+
+    return this._registerQueryCandidate(this.io.createCandidate(destination, true), registry, added)
+  }
+
+  _registerQueryCandidate(candidate, registry, added = null) {
+    const identity = this.io._candidateIdentity(candidate, true)
+    const previous = registry.get(identity.key)
+
+    if (previous !== undefined) {
+      const previousIdentity = this.io._candidateIdentity(previous, true)
+      if (!b4a.equals(previousIdentity.id, identity.id)) throw TRANSPORT_INVALID_RESPONSE()
+      return candidate
+    }
+    if (registry.size >= this.maxTransportCandidates) throw TRANSPORT_INVALID_RESPONSE()
+
+    registry.set(identity.key, candidate)
+    if (added !== null) added.push(identity.key)
+    return candidate
+  }
+
+  _closestQueryNodes(target, limit, registry, added = null) {
+    if (this.outboundPolicy === 'direct') {
+      const closest = this.table.closest(target, limit)
+      return closest.map((node) =>
+        this._queryCandidate({ id: node.id, host: node.host, port: node.port }, registry)
+      )
+    }
+
+    let closest = null
+    try {
+      closest = this.io.closest({ target, limit })
+      if (closest === null || closest === undefined) throw TRANSPORT_INVALID_RESPONSE()
+      const candidates = []
+      if (limit <= 0) return candidates
+      for (const destination of closest) {
+        candidates.push(this._queryCandidate(destination, registry, added))
+        if (candidates.length >= limit) break
+      }
+      return candidates
+    } catch (error) {
+      if (error && error.code === 'TRANSPORT_INVALID_RESPONSE') throw error
+      throw TRANSPORT_INVALID_RESPONSE()
+    }
+  }
+
+  async *_resolveQueryBootstrap(target, limit, registry, added = null) {
+    if (this.outboundPolicy === 'direct') {
+      for await (const node of this._resolveBootstrapNodes()) {
+        yield this._queryCandidate(node, registry)
+      }
+      return
+    }
+
+    let bootstrap = null
+    try {
+      bootstrap = await this.io.bootstrap({ target, limit })
+      if (bootstrap === null || bootstrap === undefined) throw TRANSPORT_INVALID_RESPONSE()
+      if (limit <= 0) return
+      let count = 0
+      for await (const destination of bootstrap) {
+        yield this._queryCandidate(destination, registry, added)
+        if (++count >= limit) break
+      }
+    } catch (error) {
+      if (error && error.code === 'TRANSPORT_INVALID_RESPONSE') throw error
+      throw TRANSPORT_INVALID_RESPONSE()
+    }
+  }
+
   ping(to, opts) {
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     let value = null
 
     if (opts && opts.size && opts.size > 0) value = b4a.alloc(opts.size)
@@ -413,6 +509,7 @@ class DHT extends EventEmitter {
   }
 
   delayedPing(to, delayMs, opts) {
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     if (delayMs > this.maxPingDelay) {
       throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
     }
@@ -499,6 +596,7 @@ class DHT extends EventEmitter {
   }
 
   request({ token = null, command, target = null, value = null }, to, opts) {
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     if (this.outboundPolicy === 'transport-only') {
       forbidDirectRequestOptions(opts)
       return this._transportRequestToPromise(to, token, false, command, target, value, opts)
@@ -535,7 +633,17 @@ class DHT extends EventEmitter {
     })
   }
 
-  _transportRequestToPromise(to, token, internal, command, target, value, opts, timeout = 0) {
+  _transportRequestToPromise(
+    to,
+    token,
+    internal,
+    command,
+    target,
+    value,
+    opts,
+    timeout = 0,
+    candidate = null
+  ) {
     let req = null
     try {
       req = this.io.createRequest(
@@ -545,7 +653,8 @@ class DHT extends EventEmitter {
         command,
         target,
         value,
-        (opts && opts.session) || null
+        (opts && opts.session) || null,
+        candidate
       )
     } catch (error) {
       return Promise.reject(error)
@@ -553,6 +662,23 @@ class DHT extends EventEmitter {
 
     if (req !== null && timeout > 0) req.timeout = timeout
     return this._requestToPromise(req, opts)
+  }
+
+  _queryCandidateRequest({ token = null, command, target = null, value = null }, candidate, opts) {
+    if (this.outboundPolicy === 'direct') {
+      return this.request({ token, command, target, value }, candidate.destination, opts)
+    }
+    return this._transportRequestToPromise(
+      candidate.destination,
+      token,
+      false,
+      command,
+      target,
+      value,
+      opts,
+      0,
+      candidate
+    )
   }
 
   async _bootstrap() {
@@ -644,9 +770,25 @@ class DHT extends EventEmitter {
     if (emitClose) this.emit('close')
   }
 
-  _request(to, force, internal, command, target, value, session, onresponse, onerror, configure) {
+  _request(
+    to,
+    force,
+    internal,
+    command,
+    target,
+    value,
+    session,
+    onresponse,
+    onerror,
+    configure,
+    candidate = null
+  ) {
     if (internal && !this._sendDownHints && command === DOWN_HINT) return null
-    const req = this.io.createRequest(to, null, internal, command, target, value, session)
+    if (session && session.destroyed) return null
+    const req =
+      this.outboundPolicy === 'transport-only'
+        ? this.io.createRequest(to, null, internal, command, target, value, session, candidate)
+        : this.io.createRequest(to, null, internal, command, target, value, session)
     if (req === null) return null
 
     req.onresponse = onresponse
@@ -1242,6 +1384,19 @@ function randomBytes(n) {
 
 function randomOffset(n) {
   return n - ((Math.random() * 0.5 * n) | 0)
+}
+
+function copyDirectIds(source) {
+  try {
+    if (!b4a.isBuffer(source) || source.byteLength !== 32) throw new Error()
+    const id = b4a.from(source)
+    if (!b4a.isBuffer(id) || id.byteLength !== 32) throw new Error()
+    const destinationId = b4a.from(id)
+    if (!b4a.isBuffer(destinationId) || destinationId.byteLength !== 32) throw new Error()
+    return { id, destinationId }
+  } catch {
+    throw new Error('Invalid direct node id')
+  }
 }
 
 function defaultUDXFactory() {

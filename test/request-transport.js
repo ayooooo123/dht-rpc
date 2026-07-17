@@ -1390,6 +1390,765 @@ test('request configuration runs before first send', (t) => {
   )
 })
 
+test('transport-only query traverses opaque destinations by adapter identity', async (t) => {
+  const a = { ref: 'a' }
+  const b = { ref: 'b' }
+  const c = { ref: 'c' }
+  const bAgain = { ref: 'b' }
+  const ids = new Map([
+    [a, b4a.alloc(32, 3)],
+    [b, b4a.alloc(32, 2)],
+    [c, b4a.alloc(32, 1)],
+    [bAgain, b4a.alloc(32, 2)]
+  ])
+  const visited = []
+  let query = null
+  const admitted = new Set()
+  const transport = createOpaqueTransport({
+    bootstrap: [a],
+    ids,
+    request(message) {
+      visited.push(message.to)
+      if (query && query._transportCandidates) {
+        for (const candidate of query._transportCandidates.values()) admitted.add(candidate)
+      }
+      const closerNodes = message.to === a ? [b] : message.to === b ? [c] : [bAgain]
+      return immediateOperation(validReply(message.to, { closerNodes }))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  query = dht.query({ target: b4a.alloc(32), command: 7 }, { concurrency: 1 })
+  const replies = []
+  query.on('data', (reply) => replies.push(reply))
+
+  await query.finished()
+
+  t.alike(visited, [a, b, c])
+  t.alike(
+    replies.map((reply) => reply.from),
+    [a, b, c]
+  )
+  t.alike(replies[0].closerNodes, [b])
+  t.alike(replies[1].closerNodes, [c])
+  t.alike(replies[2].closerNodes, [bAgain])
+  t.alike(query.closestNodes, [c, b, a])
+  t.alike([...query._seen.keys()], ['a', 'b', 'c'])
+  t.is(admitted.size, 3, 'same adapter key is admitted once')
+  for (const candidate of admitted) {
+    t.ok(Object.isFrozen(candidate))
+    t.alike(Object.keys(candidate), ['destination', 'key', 'id'])
+    t.is(candidate.id === ids.get(candidate.destination), false)
+    t.alike(candidate.id, ids.get(candidate.destination))
+    t.is('host' in candidate.destination, false)
+    t.is('port' in candidate.destination, false)
+    t.is('id' in candidate.destination, false)
+  }
+  t.is(query._transportCandidates.size, 0, 'query teardown clears candidates')
+  t.is('_refreshTicks' in dht, false, 'query does not create direct refresh state')
+  await dht.destroy()
+})
+
+test('transport-only query rejects one key with conflicting ids before visiting it', async (t) => {
+  const a = { ref: 'a' }
+  const b = { ref: 'b' }
+  const conflict = { ref: 'a' }
+  const ids = new Map([
+    [a, b4a.alloc(32, 1)],
+    [b, b4a.alloc(32, 2)],
+    [conflict, b4a.alloc(32, 3)]
+  ])
+  const visited = []
+  let stateBeforeInvalidReply = null
+  let query = null
+  const transport = createOpaqueTransport({
+    bootstrap: [a],
+    ids,
+    request(message) {
+      visited.push(message.to)
+      if (message.to === b) stateBeforeInvalidReply = query._seen.get('b')
+      return immediateOperation(
+        validReply(message.to, { closerNodes: message.to === a ? [b] : [conflict] })
+      )
+    }
+  })
+  const dht = createTransportDHT(transport)
+  query = dht.query({ target: b4a.alloc(32), command: 7 }, { concurrency: 1 })
+  const error = await promiseError(query.finished())
+
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.alike(visited, [a, b])
+  t.is(query._seen.get('b'), stateBeforeInvalidReply, 'invalid reply cannot update seen state')
+  t.is(query._transportCandidates.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only query admits closest bootstrap caller nodes and replies', async (t) => {
+  const a = { ref: 'closest' }
+  const b = { ref: 'bootstrap' }
+  const c = { ref: 'caller-node' }
+  const d = { ref: 'caller-reply' }
+  const destinations = [a, b, c, d]
+  const ids = opaqueIds(destinations)
+  const visited = []
+  const transport = createOpaqueTransport({
+    closest: [a],
+    bootstrap: async function* () {
+      yield b
+    },
+    ids,
+    request(message) {
+      visited.push(message.to)
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const target = b4a.alloc(32)
+  const fromNodes = dht.query({ target, command: 7 }, { nodes: [c], concurrency: 1 })
+  await fromNodes.finished()
+
+  t.alike(new Set(visited), new Set([a, b, c]))
+  t.alike(transport.calls.closest[0][0], { target, limit: 19 })
+  t.alike(transport.calls.bootstrap[0][0], { target, limit: 18 })
+
+  transport.localClosest = []
+  transport.remoteBootstrap = []
+  visited.length = 0
+  const fromReplies = dht.query({ target, command: 7 }, { replies: [{ from: d }], concurrency: 1 })
+  await fromReplies.finished()
+  t.alike(visited, [d])
+  await dht.destroy()
+})
+
+test('transport-only query validates every bootstrap entry before requesting', async (t) => {
+  for (const [name, bootstrap, ids] of invalidBootstrapCases()) {
+    const transport = createOpaqueTransport({ bootstrap, ids })
+    const dht = createTransportDHT(transport)
+    const query = dht.query({ target: b4a.alloc(32), command: 7 })
+    const error = await promiseError(query.finished())
+
+    t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE', name)
+    t.is(transport.calls.request.length, 0, `${name} requests`)
+    t.is(query._transportCandidates.size, 0, `${name} registry`)
+    await dht.destroy()
+  }
+})
+
+test('transport-only query construction is atomic for hostile caller seeds', async (t) => {
+  for (const { name, nodes, replies, ids } of hostileCallerSeedCases()) {
+    const transport = createOpaqueTransport({ ids })
+    const dht = createTransportDHT(transport)
+    let sessions = 0
+    const createSession = dht.session.bind(dht)
+    dht.session = function () {
+      sessions++
+      return createSession()
+    }
+    const error = syncError(() =>
+      dht.query(
+        { target: b4a.alloc(32), command: 7 },
+        nodes === undefined ? { replies } : { nodes }
+      )
+    )
+
+    t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE', name)
+    t.alike(dht.stats.queries, { active: 0, total: 0 }, `${name} stats`)
+    t.is(sessions, 0, `${name} session`)
+    t.is(transport.calls.request.length, 0, `${name} requests`)
+    t.is(dht.io._destinationRegistry.size, 0, `${name} request registry`)
+    await dht.destroy()
+  }
+})
+
+test('transport-only query rolls back hostile closest and bootstrap iterables', async (t) => {
+  for (const source of ['closest', 'bootstrap']) {
+    const destination = { ref: source }
+    const ids = opaqueIds([destination])
+    const hostile = throwingIterable(
+      destination,
+      new Error(`${source} iterator failed`),
+      source === 'bootstrap'
+    )
+    const transport = createOpaqueTransport({
+      closest: source === 'closest' ? hostile : [],
+      bootstrap: source === 'bootstrap' ? hostile : [],
+      ids
+    })
+    const dht = createTransportDHT(transport)
+    const query = dht.query({ target: b4a.alloc(32), command: 7 })
+    const error = await promiseError(query.finished())
+
+    t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE', source)
+    t.is(transport.calls.request.length, 0, `${source} requests`)
+    t.is(query._transportCandidates.size, 0, `${source} candidates`)
+    t.alike(dht.stats.queries, { active: 0, total: 1 }, `${source} stats`)
+    await dht.destroy()
+  }
+})
+
+test('transport-only query shares one bounded candidate registry', async (t) => {
+  const destinations = Array.from({ length: 21 }, (_, i) => ({ ref: `route-${i}` }))
+  const ids = opaqueIds(destinations)
+  const transport = createOpaqueTransport({
+    closest: destinations.slice(1, 9),
+    bootstrap: destinations.slice(9, 19),
+    ids,
+    request(message) {
+      t.is(query._transportCandidates.size, 19, 'all initial sources admitted before request')
+      return immediateOperation(validReply(destinations[19], { closerNodes: [destinations[20]] }))
+    }
+  })
+  const dht = createTransportDHT(transport, { maxTransportCandidates: 20 })
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [destinations[0]], concurrency: 1 }
+  )
+  const error = await promiseError(query.finished())
+
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(transport.calls.request.length, 1)
+  t.is(query._transportCandidates.size, 0, 'overflow teardown clears registry')
+  await dht.destroy()
+})
+
+test('transport-only auto commit stays in the query session and cancels on destroy', async (t) => {
+  const destination = { ref: 'commit-route' }
+  const token = b4a.alloc(32, 7)
+  const ids = opaqueIds([destination])
+  const transport = createOpaqueTransport({ ids })
+  const dht = createTransportDHT(transport)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7, value: b4a.from('value') },
+    { nodes: [destination], commit: true, concurrency: 1 }
+  )
+  const finished = query.finished()
+  await waitFor(() => transport.requests.length === 1)
+  transport.requests[0].resolve(validReply(destination, { token }))
+  await waitFor(() => transport.calls.request.length === 2)
+
+  const commit = transport.calls.request[1][0]
+  t.is(commit.to, destination)
+  t.is(commit.token, token)
+  t.is(commit.internal, false)
+  t.ok(query._session.inflight.some((request) => request.to === destination))
+
+  const terminal = new Error('query stopped')
+  query.destroy(terminal)
+  t.is(await promiseError(finished), terminal)
+  t.is(transport.calls.cancel.length, 1)
+  t.is(transport.calls.cancel[0][0].code, 'REQUEST_DESTROYED')
+  t.is(query._session.inflight.length, 0)
+  t.is(query._transportCandidates.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only query destroy cancels active traversal', async (t) => {
+  const destination = { ref: 'traversal-route' }
+  const transport = createOpaqueTransport({ ids: opaqueIds([destination]) })
+  const dht = createTransportDHT(transport)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [destination], concurrency: 1 }
+  )
+  const finished = query.finished()
+  await waitFor(() => transport.requests.length === 1)
+
+  const terminal = new Error('stop traversal')
+  query.destroy(terminal)
+
+  t.is(await promiseError(finished), terminal)
+  t.is(transport.calls.cancel.length, 1)
+  t.is(transport.calls.cancel[0][0].code, 'REQUEST_DESTROYED')
+  t.is(query._session.inflight.length, 0)
+  t.is(query._transportCandidates.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only query isolates traversal from a shared session', async (t) => {
+  const queryDestination = { ref: 'query' }
+  const unrelatedDestination = { ref: 'unrelated' }
+  const destinations = [queryDestination, unrelatedDestination]
+  const transport = createOpaqueTransport({ ids: opaqueIds(destinations) })
+  const dht = createTransportDHT(transport)
+  const shared = dht.session()
+  const unrelated = shared.request({ command: 8 }, unrelatedDestination, { retry: false })
+  await waitFor(() => transport.requests.length === 1)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [queryDestination], concurrency: 1, session: shared }
+  )
+  const finished = query.finished()
+  await waitFor(() => transport.requests.length === 2)
+
+  query.destroy(new Error('stop query'))
+  await promiseError(finished)
+  t.is(transport.calls.cancel.length, 1)
+  t.is(shared.inflight.length, 1, 'unrelated request remains attached')
+  t.is(shared.inflight[0].to, unrelatedDestination)
+  t.is(shared.children.size, 0, 'query child detaches without destroying parent')
+
+  transport.requests[0].resolve(validReply(unrelatedDestination))
+  t.is((await unrelated).from, unrelatedDestination)
+  t.is(shared.inflight.length, 0)
+  await dht.destroy()
+})
+
+test('transport-only query isolates auto commit from a shared session', async (t) => {
+  const queryDestination = { ref: 'query' }
+  const unrelatedDestination = { ref: 'unrelated' }
+  const destinations = [queryDestination, unrelatedDestination]
+  const transport = createOpaqueTransport({ ids: opaqueIds(destinations) })
+  const dht = createTransportDHT(transport)
+  const shared = dht.session()
+  const unrelated = shared.request({ command: 8 }, unrelatedDestination, { retry: false })
+  await waitFor(() => transport.requests.length === 1)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [queryDestination], concurrency: 1, session: shared, commit: true }
+  )
+  const finished = query.finished()
+  await waitFor(() => transport.requests.length === 2)
+  transport.requests[1].resolve(validReply(queryDestination, { token: b4a.alloc(32, 7) }))
+  await waitFor(() => transport.requests.length === 3)
+
+  query.destroy(new Error('stop commit'))
+  await promiseError(finished)
+  t.is(transport.calls.cancel.length, 1)
+  t.is(shared.inflight.length, 1, 'unrelated request survives commit cancellation')
+  t.is(shared.inflight[0].to, unrelatedDestination)
+  t.is(shared.children.size, 0, 'commit child detaches without destroying parent')
+
+  transport.requests[0].resolve(validReply(unrelatedDestination))
+  t.is((await unrelated).from, unrelatedDestination)
+  t.is(shared.inflight.length, 0)
+  await dht.destroy()
+})
+
+test('direct query candidates copy ids and freeze their dial descriptor', (t) => {
+  const sourceId = b4a.alloc(32, 1)
+  const source = { id: sourceId, host: '127.0.0.1', port: 1234 }
+  const dht = Object.create(DHT.prototype)
+  dht.outboundPolicy = 'direct'
+  const candidate = dht._queryCandidate(source, new Map())
+
+  sourceId.fill(9)
+  source.id = b4a.alloc(32, 8)
+  source.host = 'mutated.invalid'
+  source.port = 9999
+
+  t.ok(Object.isFrozen(candidate))
+  t.ok(Object.isFrozen(candidate.destination))
+  t.is(candidate.id === sourceId, false)
+  t.is(candidate.id === candidate.destination.id, false)
+  t.alike(candidate.id, b4a.alloc(32, 1))
+  t.alike(candidate.destination.id, b4a.alloc(32, 1))
+  t.is(candidate.key, '127.0.0.1:1234')
+  t.alike(candidate.destination, {
+    id: b4a.alloc(32, 1),
+    host: '127.0.0.1',
+    port: 1234
+  })
+})
+
+test('direct query rejects ids that shrink while being copied', (t) => {
+  const dht = Object.create(DHT.prototype)
+  dht.outboundPolicy = 'direct'
+  const registry = new Map()
+  const source = {
+    id: shrinkingId(),
+    host: '127.0.0.1',
+    port: 1234
+  }
+  const error = syncError(() => dht._queryCandidate(source, registry))
+
+  t.ok(error)
+  t.is(error && error.message, 'Invalid direct node id')
+  t.is(registry.size, 0)
+})
+
+test('transport-only bounds and closes closest and bootstrap iterators', async (t) => {
+  for (const [source, async, finite] of [
+    ['closest', false, true],
+    ['closest', false, false],
+    ['bootstrap', true, true],
+    ['bootstrap', true, false]
+  ]) {
+    const destination = { ref: `${source}-${finite ? 'finite' : 'infinite'}` }
+    const bounded = boundedIterable(destination, { async, finite, length: 5, safety: 10 })
+    const transport = createOpaqueTransport({ ids: opaqueIds([destination]) })
+    if (source === 'closest') transport.localClosest = bounded.iterable
+    else transport.remoteBootstrap = bounded.iterable
+    const dht = createTransportDHT(transport)
+    const registry = new Map()
+    const added = []
+    let candidates = null
+    let error = null
+
+    try {
+      if (source === 'closest') {
+        candidates = dht._closestQueryNodes(b4a.alloc(32), 3, registry, added)
+      } else {
+        candidates = []
+        for await (const candidate of dht._resolveQueryBootstrap(
+          b4a.alloc(32),
+          3,
+          registry,
+          added
+        )) {
+          candidates.push(candidate)
+        }
+      }
+    } catch (cause) {
+      error = cause
+    }
+
+    t.is(error, null, `${source} ${finite ? 'finite' : 'infinite'} error`)
+    t.is(candidates && candidates.length, 3, `${source} count`)
+    t.is(bounded.state.next, 3, `${source} bounded next`)
+    t.is(bounded.state.returned, 1, `${source} closes iterator`)
+    t.is(registry.size, 1, `${source} repeated key capacity`)
+    await dht.destroy()
+  }
+})
+
+test('transport-only query reuses the initial candidate identity when dialing', async (t) => {
+  const destination = { ref: 'seed' }
+  let keys = 0
+  let ids = 0
+  const transport = createOpaqueTransport({
+    bootstrap: [],
+    ids: new Map(),
+    key() {
+      return ++keys === 1 ? 'seed' : 'changed-seed'
+    },
+    id() {
+      return b4a.alloc(32, ++ids === 1 ? 1 : 9)
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [destination], concurrency: 1 }
+  )
+  const finished = query.finished()
+  await waitFor(() => transport.calls.request.length === 1)
+
+  t.is(keys, 1)
+  t.is(ids, 1)
+  t.is(dht.io.inflight[0]._identity.destination, destination)
+  t.is(dht.io.inflight[0]._identity.key, 'seed')
+  t.alike(dht.io.inflight[0]._identity.id, b4a.alloc(32, 1))
+  query.destroy(new Error('done'))
+  await promiseError(finished)
+  await dht.destroy()
+})
+
+test('transport-only query reuses validated reply identities when dialing closer nodes', async (t) => {
+  const a = { ref: 'a' }
+  const b = { ref: 'b' }
+  const reads = new Map()
+  let bReadsAtDial = null
+  let bIdentityAtDial = null
+  const transport = createOpaqueTransport({
+    bootstrap: [a],
+    ids: new Map(),
+    key(destination) {
+      const count = (reads.get(destination) || 0) + 1
+      reads.set(destination, count)
+      return destination.ref + (destination === b && count > 1 ? '-changed' : '')
+    },
+    id(destination) {
+      const count = reads.get(destination)
+      return b4a.alloc(32, destination === b && count > 1 ? 9 : destination === a ? 1 : 2)
+    },
+    request(message) {
+      if (message.to === a) {
+        return immediateOperation(validReply(a, { closerNodes: [b] }))
+      }
+      bReadsAtDial = reads.get(b)
+      const request = dht.io.inflight.find((candidate) => candidate.to === b)
+      bIdentityAtDial = request && request._identity
+      return { promise: new Promise(() => {}), cancel() {} }
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const query = dht.query({ target: b4a.alloc(32), command: 7 }, { concurrency: 1 })
+  const finished = query.finished()
+  await waitFor(() => transport.calls.request.length === 2)
+
+  t.is(bReadsAtDial, 1)
+  t.is(bIdentityAtDial.destination, b)
+  t.is(bIdentityAtDial.key, 'b')
+  t.alike(bIdentityAtDial.id, b4a.alloc(32, 2))
+  query.destroy(new Error('done'))
+  await promiseError(finished)
+  await dht.destroy()
+})
+
+test('destroying a parent session terminates child queries without resurrection', async (t) => {
+  const unrelatedDestination = { ref: 'unrelated' }
+  const a = { ref: 'a' }
+  const b = { ref: 'b' }
+  const destinations = [unrelatedDestination, a, b]
+  const transport = createOpaqueTransport({ ids: opaqueIds(destinations) })
+  const dht = createTransportDHT(transport)
+  const parent = dht.session()
+  const unrelated = parent.request({ command: 8 }, unrelatedDestination, { retry: false })
+  await waitFor(() => transport.calls.request.length === 1)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [a, b], concurrency: 1, session: parent }
+  )
+  const finished = query.finished()
+  await waitFor(() => transport.calls.request.length === 2)
+  const terminal = new Error('parent closed')
+
+  parent.destroy(terminal)
+  await tick()
+  if (transport.requests[2]) transport.requests[2].reject(terminal)
+  t.is(await promiseError(unrelated), terminal)
+  t.is(await promiseError(finished), terminal)
+  await tick()
+  t.is(transport.calls.request.length, 2, 'does not start the second query request')
+  t.is(transport.calls.cancel.length, 2)
+  t.is(parent.inflight.length, 0)
+  t.is(parent.children.size, 0)
+  t.is(parent.destroyed, true)
+
+  parent.destroy(new Error('reentrant close'))
+  t.is(transport.calls.cancel.length, 2, 'repeated destroy is clean')
+  const late = await promiseError(parent.request({ command: 9 }, b, { retry: false }))
+  t.is(late, terminal)
+  t.is(transport.calls.request.length, 2, 'closed session cannot attach new requests')
+  await dht.destroy()
+})
+
+test('destroying a parent immediately terminates an unopened child query', async (t) => {
+  const transport = createOpaqueTransport()
+  const dht = createTransportDHT(transport)
+  const parent = dht.session()
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { session: parent, concurrency: 1 }
+  )
+  const terminal = new Error('unopened parent closed')
+
+  parent.destroy(terminal)
+  const destroyingImmediately = query.destroying
+  const error = await promiseError(query.finished())
+
+  t.is(destroyingImmediately, true)
+  t.is(error, terminal)
+  t.is(dht.stats.queries.active, 0)
+  t.is(parent.children.size, 0)
+  t.is(transport.calls.closest.length, 0)
+  t.is(transport.calls.bootstrap.length, 0)
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+test('transport-only open stops before bootstrap when closest admission closes parent', async (t) => {
+  const destination = { ref: 'closest-closes-parent' }
+  const terminal = new Error('closest closed parent')
+  let parent = null
+  const transport = createOpaqueTransport({
+    closest: [destination],
+    ids: opaqueIds([destination]),
+    key() {
+      parent.destroy(terminal)
+      return destination.ref
+    }
+  })
+  const dht = createTransportDHT(transport)
+  parent = dht.session()
+  const query = parent.query({ target: b4a.alloc(32), command: 7 }, { concurrency: 1 })
+  const error = await promiseError(query.finished())
+
+  t.is(error, terminal)
+  t.is(transport.calls.closest.length, 1)
+  t.is(transport.calls.bootstrap.length, 0)
+  t.is(transport.calls.request.length, 0)
+  t.is(dht.stats.queries.active, 0)
+  t.is(query._transportCandidates.size, 0)
+  t.is(parent.children.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only open closes bootstrap iterator when admission closes parent', async (t) => {
+  const destination = { ref: 'bootstrap-closes-parent' }
+  const terminal = new Error('bootstrap closed parent')
+  const bootstrap = boundedIterable(destination, {
+    async: true,
+    finite: false,
+    length: 0,
+    safety: 21
+  })
+  let parent = null
+  const transport = createOpaqueTransport({
+    bootstrap: bootstrap.iterable,
+    ids: opaqueIds([destination]),
+    key() {
+      parent.destroy(terminal)
+      return destination.ref
+    }
+  })
+  const dht = createTransportDHT(transport)
+  parent = dht.session()
+  const query = parent.query({ target: b4a.alloc(32), command: 7 }, { concurrency: 1 })
+  const error = await promiseError(query.finished())
+
+  t.is(error, terminal)
+  t.is(transport.calls.bootstrap.length, 1)
+  t.is(bootstrap.state.next, 1)
+  t.is(bootstrap.state.returned, 1)
+  t.is(transport.calls.request.length, 0)
+  t.is(dht.stats.queries.active, 0)
+  t.is(query._transportCandidates.size, 0)
+  t.is(parent.children.size, 0)
+  await dht.destroy()
+})
+
+test('transport-only discards a queued reply after query teardown', async (t) => {
+  const a = { ref: 'settled' }
+  const b = { ref: 'late-closer' }
+  const transport = createOpaqueTransport({ ids: opaqueIds([a, b]) })
+  const dht = createTransportDHT(transport)
+  let mapped = 0
+  let pushed = 0
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    {
+      nodes: [a],
+      concurrency: 1,
+      map(reply) {
+        mapped++
+        return reply
+      }
+    }
+  )
+  query.on('data', () => pushed++)
+  const finished = query.finished()
+  await waitFor(() => transport.calls.request.length === 1)
+  const req = dht.io.inflight[0]
+  const key = dht._nodeKey(query._requestCandidates.get(req))
+  const seen = query._seen.get(key)
+  const reply = dht.io._validateReply(validReply(a, { closerNodes: [b] }), req._identity)
+
+  req._settle(null, reply)
+  const terminal = new Error('destroy after settle')
+  query.destroy(terminal)
+  t.is(await promiseError(finished), terminal)
+  await tick()
+
+  t.is(mapped, 0)
+  t.is(pushed, 0)
+  t.is(query.successes, 0)
+  t.is(query.errors, 0)
+  t.is(query.closestReplies.length, 0)
+  t.is(query._seen.size, 1)
+  t.is(query._seen.get(key), seen)
+  t.is(query._transportCandidates.size, 0)
+  t.is(dht.io._replyCandidates.has(reply), false)
+  t.is(query.inflight, 0)
+  t.is(transport.calls.request.length, 1)
+  await dht.destroy()
+})
+
+test('transport-only identity cannot resurrect a session during request creation', async (t) => {
+  const destination = { ref: 'identity-destroys-session' }
+  const terminal = new Error('identity closed session')
+  let session = null
+  const transport = createOpaqueTransport({
+    ids: opaqueIds([destination]),
+    key() {
+      session.destroy(terminal)
+      return destination.ref
+    },
+    request(message) {
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  session = dht.session()
+  const error = await promiseError(session.request({ command: 7 }, destination, { retry: false }))
+
+  t.is(error, terminal)
+  t.is(session.inflight.length, 0)
+  t.is(dht.io.inflight.length, 0)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.stats.requests.total, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+test('transport-only seed identity cannot activate a query after closing its parent', async (t) => {
+  const destination = { ref: 'seed-destroys-parent' }
+  const terminal = new Error('seed closed parent')
+  let parent = null
+  const transport = createOpaqueTransport({
+    ids: opaqueIds([destination]),
+    key() {
+      parent.destroy(terminal)
+      return destination.ref
+    }
+  })
+  const dht = createTransportDHT(transport)
+  parent = dht.session()
+  let query = null
+  const constructionError = syncError(() => {
+    query = parent.query(
+      { target: b4a.alloc(32), command: 7 },
+      { nodes: [destination], concurrency: 1 }
+    )
+  })
+  const activeAfterConstruction = dht.stats.queries.active
+  const terminalError = query ? await promiseError(query.finished()) : constructionError
+
+  t.is(constructionError, terminal)
+  t.is(query, null)
+  t.is(terminalError, terminal)
+  t.is(activeAfterConstruction, 0)
+  t.alike(dht.stats.queries, { active: 0, total: 0 })
+  t.is(parent.children.size, 0)
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+test('direct and transport public APIs preserve closed session terminals', async (t) => {
+  const Session = require('../lib/session')
+  for (const outboundPolicy of ['direct', 'transport-only']) {
+    const terminal = new Error(`${outboundPolicy} closed`)
+    const dht = Object.create(DHT.prototype)
+    dht.destroyed = false
+    dht.outboundPolicy = outboundPolicy
+    const session = new Session(dht)
+    session.destroy(terminal)
+    const destination = { host: '127.0.0.1', port: 1 }
+
+    t.is(
+      await promiseError(dht.request({ command: 7 }, destination, { session })),
+      terminal,
+      `${outboundPolicy} request`
+    )
+    t.is(await promiseError(dht.ping(destination, { session })), terminal, `${outboundPolicy} ping`)
+    t.is(
+      await promiseError(dht.delayedPing(destination, 1, { session })),
+      terminal,
+      `${outboundPolicy} delayed ping`
+    )
+    t.is(
+      syncError(() => dht.query({ target: b4a.alloc(32), command: 7 }, { session })),
+      terminal,
+      `${outboundPolicy} query`
+    )
+    t.is(
+      syncError(() => dht.findNode(b4a.alloc(32), { session })),
+      terminal,
+      `${outboundPolicy} find node`
+    )
+  }
+})
+
 test('query configures retries and cycles before DHT sends', (t) => {
   const Query = require('../lib/query')
   const query = Object.create(Query.prototype)
@@ -1406,16 +2165,22 @@ test('query configures retries and cycles before DHT sends', (t) => {
   query._onvisitbound = () => {}
   query._onerrorbound = () => {}
   query._oncyclebound = () => {}
+  query._requestCandidates = new WeakMap()
+  const destination = { host: '127.0.0.1', port: 1 }
+  const candidate = { destination, key: '127.0.0.1:1', id: b4a.alloc(32) }
+  let requested = null
   query.dht = {
     _request(...args) {
+      requested = args[0]
       configure = args[9]
       return req
     }
   }
 
-  query._visit({ host: '127.0.0.1', port: 1 })
+  query._visit(candidate)
   t.is(typeof configure, 'function')
   if (configure) configure(req)
+  t.is(requested, destination, 'passes the raw direct destination')
   t.is(req.retries, 0, 'force disables retries before send')
   t.is(req.oncycle, query._oncyclebound)
 })
@@ -1489,6 +2254,138 @@ function createTransport(overrides = {}) {
   }
 
   return transport
+}
+
+function createOpaqueTransport({ bootstrap = [], closest = [], ids, key, id, request } = {}) {
+  const transport = createTransport()
+  transport.localClosest = closest
+  transport.remoteBootstrap = bootstrap
+  transport.bootstrap = function (opts) {
+    transport.calls.bootstrap.push([opts])
+    return typeof this.remoteBootstrap === 'function'
+      ? this.remoteBootstrap(opts)
+      : Promise.resolve(this.remoteBootstrap)
+  }
+  transport.closest = function (opts) {
+    transport.calls.closest.push([opts])
+    return this.localClosest
+  }
+  transport.key = function (destination) {
+    transport.calls.key.push([destination])
+    return key ? key(destination) : destination.ref
+  }
+  transport.id = function (destination) {
+    transport.calls.id.push([destination])
+    return id ? id(destination) : ids && ids.get(destination)
+  }
+  if (request) {
+    transport.request = function (message) {
+      transport.calls.request.push([message])
+      return request(message)
+    }
+  }
+  return transport
+}
+
+function opaqueIds(destinations) {
+  return new Map(destinations.map((destination, i) => [destination, b4a.alloc(32, i + 1)]))
+}
+
+function invalidBootstrapCases() {
+  const valid = { ref: 'valid' }
+  const invalid = { ref: 'invalid' }
+  const first = { ref: 'same' }
+  const conflict = { ref: 'same' }
+  return [
+    ['invalid identity', [valid, invalid], new Map([[valid, b4a.alloc(32, 1)]])],
+    [
+      'conflicting identity',
+      [first, conflict],
+      new Map([
+        [first, b4a.alloc(32, 1)],
+        [conflict, b4a.alloc(32, 2)]
+      ])
+    ]
+  ]
+}
+
+function hostileCallerSeedCases() {
+  const first = { ref: 'same' }
+  const conflict = { ref: 'same' }
+  const valid = { ref: 'valid' }
+  const ids = new Map([
+    [first, b4a.alloc(32, 1)],
+    [conflict, b4a.alloc(32, 2)],
+    [valid, b4a.alloc(32, 3)]
+  ])
+  const hostileNodes = [valid, valid]
+  Object.defineProperty(hostileNodes, 0, {
+    get() {
+      throw new Error('node getter failed')
+    }
+  })
+  const hostileReply = {}
+  Object.defineProperty(hostileReply, 'from', {
+    get() {
+      throw new Error('from getter failed')
+    }
+  })
+  const hostileLength = {}
+  Object.defineProperty(hostileLength, 'length', {
+    get() {
+      throw new Error('length getter failed')
+    }
+  })
+  return [
+    { name: 'conflicting nodes', nodes: [first, conflict], ids },
+    { name: 'conflicting replies', replies: [{ from: first }, { from: conflict }], ids },
+    { name: 'hostile node getter', nodes: hostileNodes, ids },
+    { name: 'hostile reply getter', replies: [{ from: valid }, hostileReply], ids },
+    { name: 'hostile length getter', nodes: hostileLength, ids }
+  ]
+}
+
+function throwingIterable(destination, error, async) {
+  if (async) {
+    return {
+      async *[Symbol.asyncIterator]() {
+        yield destination
+        throw error
+      }
+    }
+  }
+  return {
+    *[Symbol.iterator]() {
+      yield destination
+      throw error
+    }
+  }
+}
+
+function boundedIterable(destination, { async, finite, length, safety }) {
+  const state = { next: 0, returned: 0 }
+  const iterator = {
+    next() {
+      state.next++
+      if (state.next > safety) throw new Error('iterator was not bounded')
+      if (finite && state.next > length) return { done: true }
+      return async
+        ? Promise.resolve({ done: false, value: destination })
+        : { done: false, value: destination }
+    },
+    return() {
+      state.returned++
+      return async ? Promise.resolve({ done: true }) : { done: true }
+    }
+  }
+  const iterable = async
+    ? { [Symbol.asyncIterator]: () => iterator }
+    : { [Symbol.iterator]: () => iterator }
+  return { iterable, state }
+}
+
+function immediateOperation(reply) {
+  return { promise: Promise.resolve(reply), cancel() {} }
 }
 
 function deferred() {
@@ -1619,6 +2516,14 @@ async function promiseError(promise) {
   } catch (error) {
     return error
   }
+}
+
+async function waitFor(condition) {
+  for (let i = 0; i < 20; i++) {
+    if (condition()) return
+    await tick()
+  }
+  throw new Error('condition not reached')
 }
 
 async function callError(fn) {
