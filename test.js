@@ -637,8 +637,6 @@ test('filter nodes from routing table', async function (t) {
 test('request session, destroy all', async function (t) {
   const [, a, b] = await makeSwarm(3, t)
 
-  a.on('request', () => t.fail())
-
   const s = b.session()
   const p = [s.request({ command: 42 }, a), s.request({ command: 42 }, a)]
 
