@@ -196,6 +196,7 @@ class DHT extends EventEmitter {
   static DEFAULTS = DEFAULTS
 
   static bootstrapper(port, host, opts) {
+    if (opts && opts.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!port) throw new Error('Port is required')
     if (!host) throw new Error('Host is required')
     if (host === '0.0.0.0' || host === '::') throw new Error('Invalid host')
@@ -229,6 +230,7 @@ class DHT extends EventEmitter {
   }
 
   get randomized() {
+    if (this.outboundPolicy === 'transport-only') return false
     return this._nat.host !== null && this._nat.port === 0
   }
 
@@ -320,6 +322,7 @@ class DHT extends EventEmitter {
   }
 
   localAddress() {
+    if (this.outboundPolicy === 'transport-only') return null
     if (!this.io.serverSocket) return null
 
     return {
@@ -329,6 +332,7 @@ class DHT extends EventEmitter {
   }
 
   remoteAddress() {
+    if (this.outboundPolicy === 'transport-only') return null
     if (!this.host) return null
     if (!this.port) return null
     if (this.firewalled) return null
@@ -343,7 +347,9 @@ class DHT extends EventEmitter {
     }
   }
 
-  addNode({ host, port }) {
+  addNode(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
+    const { host, port } = node
     this._addNode({
       id: peer.id(host, port),
       port,
@@ -483,15 +489,17 @@ class DHT extends EventEmitter {
   }
 
   ping(to, opts) {
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+      const value = opts && opts.size && opts.size > 0 ? b4a.alloc(opts.size) : null
+      return this._transportRequestToPromise(to, null, true, PING, null, value, opts)
+    }
+
     if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     let value = null
 
     if (opts && opts.size && opts.size > 0) value = b4a.alloc(opts.size)
-
-    if (this.outboundPolicy === 'transport-only') {
-      forbidDirectRequestOptions(opts)
-      return this._transportRequestToPromise(to, null, true, PING, null, value, opts)
-    }
 
     const { host, port } = to
 
@@ -509,16 +517,15 @@ class DHT extends EventEmitter {
   }
 
   delayedPing(to, delayMs, opts) {
-    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
-    if (delayMs > this.maxPingDelay) {
-      throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
-    }
-
-    const value = b4a.allocUnsafe(4)
-    c.uint32.encode({ start: 0, end: 4, buffer: value }, delayMs)
-
     if (this.outboundPolicy === 'transport-only') {
       forbidDirectRequestOptions(opts)
+      if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+      if (delayMs > this.maxPingDelay) {
+        throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
+      }
+
+      const value = b4a.allocUnsafe(4)
+      c.uint32.encode({ start: 0, end: 4, buffer: value }, delayMs)
       return this._transportRequestToPromise(
         to,
         null,
@@ -530,6 +537,14 @@ class DHT extends EventEmitter {
         delayMs + 1_000
       )
     }
+
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+    if (delayMs > this.maxPingDelay) {
+      throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
+    }
+
+    const value = b4a.allocUnsafe(4)
+    c.uint32.encode({ start: 0, end: 4, buffer: value }, delayMs)
 
     const { host, port } = to
 
@@ -564,6 +579,8 @@ class DHT extends EventEmitter {
       }
     }
 
+    if (this.outboundPolicy === 'transport-only') return stats
+
     if (this.nodes.latest) {
       const q = this.findNode(this.nodes.latest.id)
 
@@ -595,13 +612,16 @@ class DHT extends EventEmitter {
     return stats
   }
 
-  request({ token = null, command, target = null, value = null }, to, opts) {
-    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+  request(message, to, opts) {
     if (this.outboundPolicy === 'transport-only') {
       forbidDirectRequestOptions(opts)
+      const { token = null, command, target = null, value = null } = message
+      if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
       return this._transportRequestToPromise(to, token, false, command, target, value, opts)
     }
 
+    const { token = null, command, target = null, value = null } = message
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     const { host, port } = to
     const req = this.io.createRequest(
       { id: null, host, port },
@@ -748,6 +768,7 @@ class DHT extends EventEmitter {
   }
 
   refresh() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     const node = this.table.random()
     this._backgroundQuery(node ? node.id : this.table.id).on('error', noop)
   }
@@ -783,12 +804,31 @@ class DHT extends EventEmitter {
     configure,
     candidate = null
   ) {
+    if (this.outboundPolicy === 'transport-only') {
+      if (candidate === null) throw DIRECT_IO_FORBIDDEN()
+      this.io._candidateIdentity(candidate, false, to)
+      if (session && session.destroyed) return null
+      const req = this.io.createRequest(
+        to,
+        null,
+        internal,
+        command,
+        target,
+        value,
+        session,
+        candidate
+      )
+      if (req === null) return null
+      req.onresponse = onresponse
+      req.onerror = onerror
+      if (configure) configure(req)
+      req.send(force)
+      return req
+    }
+
     if (internal && !this._sendDownHints && command === DOWN_HINT) return null
     if (session && session.destroyed) return null
-    const req =
-      this.outboundPolicy === 'transport-only'
-        ? this.io.createRequest(to, null, internal, command, target, value, session, candidate)
-        : this.io.createRequest(to, null, internal, command, target, value, session)
+    const req = this.io.createRequest(to, null, internal, command, target, value, session)
     if (req === null) return null
 
     req.onresponse = onresponse
@@ -800,6 +840,7 @@ class DHT extends EventEmitter {
   }
 
   _natAdd(host, port) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     const prevHost = this._nat.host
     const prevPort = this._nat.port
 
@@ -812,6 +853,7 @@ class DHT extends EventEmitter {
 
   // we don't check that this is a bootstrap node but we limit the sample size to very few nodes, so fine
   _sampleBootstrapMaybe(from, to) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (this._nonePersistentSamples.length >= Math.max(1, this.bootstrapNodes.length)) return
     const id = from.host + ':' + from.port
     if (this._nonePersistentSamples.indexOf(id) > -1) return
@@ -820,6 +862,7 @@ class DHT extends EventEmitter {
   }
 
   _addNodeFromNetwork(sample, from, to) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (this._filterNode !== null && !this._filterNode(from)) {
       return
     }
@@ -860,6 +903,7 @@ class DHT extends EventEmitter {
   }
 
   _addNode(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (this.nodes.has(node) || b4a.equals(node.id, this.table.id)) return
 
     node.added = node.pinged = node.seen = this._tick
@@ -876,10 +920,12 @@ class DHT extends EventEmitter {
   }
 
   _removeStaleNode(node, lastSeen) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (node.seen <= lastSeen) this._removeNode(node)
   }
 
   _removeNode(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!this.nodes.has(node)) return
 
     this.table.remove(node.id)
@@ -889,6 +935,7 @@ class DHT extends EventEmitter {
   }
 
   _onwakeup() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     this._tick += 2 * OLD_NODE // bump the tick enough that everything appears old.
     this._tick += 8 - (this._tick & 7) - 2 // triggers a series of pings in two ticks
     this._stableTicks = MORE_STABLE_TICKS
@@ -912,6 +959,7 @@ class DHT extends EventEmitter {
   }
 
   _onfullrow(newNode, row) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!this.bootstrapped || this._repinging >= 3) return
 
     let oldest = null
@@ -938,6 +986,7 @@ class DHT extends EventEmitter {
   }
 
   _repingAndSwap(newNode, oldNode) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     const self = this
     const lastSeen = oldNode.seen
 
@@ -969,6 +1018,7 @@ class DHT extends EventEmitter {
   }
 
   _onrequest(req, external) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (req.from.id !== null) {
       this._addNodeFromNetwork(!external, req.from, req.to)
     }
@@ -1026,10 +1076,12 @@ class DHT extends EventEmitter {
   }
 
   onrequest(req) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     return this.emit('request', req)
   }
 
   _ondelayedping(req) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (req.value === null || req.value.byteLength < 4) return
     const delayMs = c.uint32.decode({ start: 0, end: 4, buffer: req.value })
     if (delayMs > this.maxPingDelay) return
@@ -1042,16 +1094,19 @@ class DHT extends EventEmitter {
   }
 
   _onresponse(res, external) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     this._addNodeFromNetwork(!external, res.from, res.to)
   }
 
   _ontimeout(req) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!req.to.id) return
     const node = this.table.get(req.to.id)
     if (node) this._removeNode(node)
   }
 
   _pingSome() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     let cnt = this.io.inflight.length > 2 ? 3 : 5
     let oldest = this.nodes.oldest
 
@@ -1074,6 +1129,7 @@ class DHT extends EventEmitter {
   }
 
   _check(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     node.pinged = this._tick
 
     const lastSeen = node.seen
@@ -1101,6 +1157,7 @@ class DHT extends EventEmitter {
   }
 
   _ontick() {
+    if (this.outboundPolicy === 'transport-only') return
     const time = Date.now()
 
     if (time - this._lastTick > SLEEPING_INTERVAL && this.suspended === false) {
@@ -1138,6 +1195,7 @@ class DHT extends EventEmitter {
   }
 
   async _updateNetworkState(onlyFirewall = false) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!this.ephemeral) return false
     if (onlyFirewall && !this.firewalled) return false
 
@@ -1214,6 +1272,7 @@ class DHT extends EventEmitter {
   }
 
   async *_resolveBootstrapNodes() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     for (let { host, port } of this.bootstrapNodes) {
       let doLookup = false
 
@@ -1247,12 +1306,15 @@ class DHT extends EventEmitter {
   }
 
   async _addBootstrapNodes(nodes) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     for await (const node of this._resolveBootstrapNodes()) {
       nodes.push(node)
     }
   }
 
-  async _checkIfFirewalled(natSampler = new NatSampler()) {
+  async _checkIfFirewalled(natSampler) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
+    if (natSampler === undefined) natSampler = new NatSampler()
     const nodes = []
     for (let node = this.nodes.latest; node && nodes.length < 5; node = node.prev) {
       nodes.push(node)
@@ -1302,6 +1364,7 @@ class DHT extends EventEmitter {
   }
 
   _backgroundQuery(target) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     this._refreshTicks = REFRESH_TICKS
 
     const backgroundCon = Math.min(this.concurrency, Math.max(2, (this.concurrency / 8) | 0))

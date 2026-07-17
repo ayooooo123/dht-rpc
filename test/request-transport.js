@@ -164,6 +164,559 @@ test('transport-only construction has no direct network state', (t) => {
   t.ok(dht._bootstrapping && typeof dht._bootstrapping.then === 'function')
 })
 
+test('transport-only direct state access is safe and inert', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+
+  t.is(dht.randomized, false)
+  t.is(dht.address(), null)
+  t.is(dht.localAddress(), null)
+  t.is(dht.remoteAddress(), null)
+  t.alike(
+    dht.toArray({
+      get limit() {
+        throw new Error('transport-only read direct toArray options')
+      }
+    }),
+    []
+  )
+  t.alike(await dht.rttStats(), {
+    successes: 0,
+    errors: 0,
+    responses: { avgRtt: 0, errors: 0, avgCloserNodes: 0 },
+    closestReplies: { avgRtt: 0, errors: 0, avgCloserNodes: 0 }
+  })
+
+  t.is(transport.calls.closest.length, 0)
+  t.is(transport.calls.bootstrap.length, 0)
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+test('transport-only rejects every direct DHT entrypoint before authority access', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const authority = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('direct authority was read')
+      }
+    }
+  )
+
+  for (const invoke of [
+    () => dht.addNode(authority),
+    () => dht.refresh(),
+    () => dht._onrequest(authority, false),
+    () => dht._onresponse(authority, false),
+    () => dht._ontimeout(authority),
+    () => dht._backgroundQuery(b4a.alloc(32))
+  ]) {
+    const error = syncError(invoke)
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  }
+
+  const bootstrapError = syncError(() =>
+    DHT.bootstrapper(1, '127.0.0.1', {
+      outboundPolicy: 'transport-only',
+      requestTransport: transport,
+      udxFactory() {
+        throw new Error('bootstrapper constructed UDX')
+      }
+    })
+  )
+  t.is(bootstrapError && bootstrapError.code, 'DIRECT_IO_FORBIDDEN')
+
+  for (const calls of Object.values(transport.calls)) {
+    if (calls === transport.calls.ready) continue
+    t.is(calls.length, 0)
+  }
+  await dht.destroy()
+})
+
+test('transport-only bootstrapper rejects before direct argument validation', (t) => {
+  const transport = createTransport()
+  let factoryCalls = 0
+  const options = {
+    outboundPolicy: 'transport-only',
+    requestTransport: transport,
+    udxFactory() {
+      factoryCalls++
+      throw new Error('bootstrapper initialized UDX')
+    }
+  }
+  Object.defineProperty(options, 'port', {
+    enumerable: true,
+    get() {
+      throw new Error('bootstrapper read direct options')
+    }
+  })
+  const hostile = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('bootstrapper read direct argument')
+      }
+    }
+  )
+
+  for (const [port, host] of [
+    [0, null],
+    [1, null],
+    [1, 'not-an-ip'],
+    [hostile, hostile],
+    [1, '127.0.0.1']
+  ]) {
+    const error = syncError(() => DHT.bootstrapper(port, host, options))
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  }
+
+  t.is(factoryCalls, 0)
+  for (const calls of Object.values(transport.calls)) t.is(calls.length, 0)
+})
+
+test('transport-only inbound request hooks reject before listeners and timers', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const authority = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('inbound request authority was read')
+      }
+    }
+  )
+  let listenerCalls = 0
+  let timerCalls = 0
+  dht.on('request', () => listenerCalls++)
+
+  for (const invoke of [() => dht.onrequest(authority), () => dht._ondelayedping(authority)]) {
+    const error = syncError(invoke)
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  }
+
+  const originalSetTimeout = global.setTimeout
+  global.setTimeout = () => {
+    timerCalls++
+    return {}
+  }
+  try {
+    const error = syncError(() => dht._ondelayedping({ value: b4a.alloc(4) }))
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  } finally {
+    global.setTimeout = originalSetTimeout
+  }
+
+  t.is(listenerCalls, 0)
+  t.is(timerCalls, 0)
+  for (const calls of Object.values(transport.calls)) {
+    if (calls === transport.calls.ready) continue
+    t.is(calls.length, 0)
+  }
+  await dht.destroy()
+})
+
+test('transport-only direct request options win over hostile public arguments', async (t) => {
+  for (const directOption of ['ttl', 'socket']) {
+    const transport = createTransport()
+    const dht = createTransportDHT(transport)
+    const authority = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('public request authority was read')
+        }
+      }
+    )
+    const delay = {
+      valueOf() {
+        throw new Error('delay was validated')
+      }
+    }
+    const opts = { [directOption]: directOption === 'ttl' ? 1 : {} }
+    for (const property of ['session', 'size', 'retry']) {
+      Object.defineProperty(opts, property, {
+        get() {
+          throw new Error(`${property} was read`)
+        }
+      })
+    }
+
+    for (const invoke of [
+      () => dht.ping(authority, opts),
+      () => dht.delayedPing(authority, delay, opts),
+      () => dht.request(authority, authority, opts)
+    ]) {
+      const error = syncError(invoke)
+      t.is(error && error.code, 'DIRECT_IO_FORBIDDEN', `${directOption} precedence`)
+    }
+
+    t.alike(dht.stats.requests, {
+      active: 0,
+      total: 0,
+      responses: 0,
+      timeouts: 0,
+      retries: 0
+    })
+    t.is(transport.calls.request.length, 0)
+    await dht.destroy()
+  }
+})
+
+test('transport-only creation rechecks lifecycle after identity callbacks', async (t) => {
+  for (const [name, terminate, code] of [
+    ['destroy', (dht) => dht.destroy(), 'REQUEST_DESTROYED'],
+    ['suspend', (dht) => dht.suspend(), 'IO_SUSPENDED']
+  ]) {
+    let dht = null
+    let lifecycle = null
+    const transport = createTransport({
+      key(destination) {
+        transport.calls.key.push([destination])
+        lifecycle = terminate(dht)
+        return destination === transport.destinations[0] ? 'route-a' : 'route-b'
+      }
+    })
+    dht = createTransportDHT(transport)
+
+    const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+    const error = await promiseError(result)
+    await lifecycle
+
+    t.is(error && error.code, code, name)
+    t.alike(dht.stats.requests, {
+      active: 0,
+      total: 0,
+      responses: 0,
+      timeouts: 0,
+      retries: 0
+    })
+    t.is(dht.io.inflight.length, 0)
+    t.is(dht.io._destinationRegistry.size, 0)
+    t.is(transport.calls.request.length, 0)
+    if (!dht.destroyed) await dht.destroy()
+  }
+})
+
+test('transport-only cancels operations returned after reentrant destroy', async (t) => {
+  for (const cancelThrows of [false, true]) {
+    const timer = manualTimer()
+    const pending = deferred()
+    const cancelError = new Error('reentrant cancel failed')
+    const cancels = []
+    const emitted = []
+    let destroying = null
+    let dht = null
+    const transport = createTransport({
+      request(message) {
+        transport.calls.request.push([message])
+        destroying = dht.destroy()
+        return {
+          promise: pending.promise,
+          cancel(reason) {
+            cancels.push(reason)
+            if (cancelThrows) throw cancelError
+          }
+        }
+      }
+    })
+    dht = createTransportDHT(transport, { requestTimer: timer })
+    dht.on('transport-error', (error) => emitted.push(error))
+
+    const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+    await tick()
+    const error = await promiseError(result)
+    await destroying
+    await tick()
+
+    t.is(error && error.code, 'REQUEST_DESTROYED')
+    t.is(cancels.length, 1)
+    t.is(cancels[0], error)
+    t.is(timer.size(), 0)
+    t.is(dht.io.inflight.length, 0)
+    t.is(dht.io._destinationRegistry.size, 0)
+    t.is(dht.stats.requests.active, 0)
+    t.is(dht.stats.requests.responses, 0)
+    t.is(emitted.length, cancelThrows ? 1 : 0)
+    if (cancelThrows) {
+      t.is(emitted[0].code, 'TRANSPORT_UNAVAILABLE')
+      t.is(emitted[0].cause, cancelError)
+    }
+
+    pending.resolve(validReply(transport.destinations[1]))
+    await tick()
+    t.is(dht.stats.requests.responses, 0)
+  }
+})
+
+test('transport-only consumes rejected operations returned after reentrant destroy', async (t) => {
+  const timer = manualTimer()
+  const cancels = []
+  const lateError = new Error('late operation rejection')
+  let destroying = null
+  let dht = null
+  let rejectOperation = null
+  let thenReads = 0
+  let thenCalls = 0
+  let thenReceiver = null
+  const operationPromise = {}
+  Object.defineProperty(operationPromise, 'then', {
+    get() {
+      thenReads++
+      if (thenReads > 1) throw new Error('then authority reread')
+      return function (_resolve, reject) {
+        thenCalls++
+        thenReceiver = this
+        rejectOperation = reject
+      }
+    }
+  })
+  const transport = createTransport({
+    request(message) {
+      transport.calls.request.push([message])
+      destroying = dht.destroy()
+      return {
+        promise: operationPromise,
+        cancel(reason) {
+          cancels.push(reason)
+        }
+      }
+    }
+  })
+  dht = createTransportDHT(transport, { requestTimer: timer })
+
+  const result = dht.request({ command: 7 }, transport.destinations[0], { retry: false })
+  await tick()
+  const error = await promiseError(result)
+  await destroying
+
+  t.is(error && error.code, 'REQUEST_DESTROYED')
+  t.is(thenReads, 1)
+  t.is(thenCalls, 1)
+  t.is(thenReceiver, operationPromise)
+  t.is(typeof rejectOperation, 'function')
+  t.is(cancels.length, 1)
+  t.is(cancels[0], error)
+  t.is(timer.size(), 0)
+  t.is(dht.io.inflight.length, 0)
+  t.is(dht.io._destinationRegistry.size, 0)
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.stats.requests.responses, 0)
+
+  rejectOperation(lateError)
+  await tick()
+  t.is(dht.stats.requests.active, 0)
+  t.is(dht.stats.requests.responses, 0)
+})
+
+test('transport-only guards direct routing helpers and authenticates internal requests', async (t) => {
+  const destination = { ref: 'admitted' }
+  const transport = createOpaqueTransport({
+    bootstrap: [destination],
+    ids: opaqueIds([destination]),
+    request(message) {
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const authority = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('direct routing authority was read')
+      }
+    }
+  )
+
+  for (const invoke of [
+    () => dht._natAdd(authority, authority),
+    () => dht._sampleBootstrapMaybe(authority, authority),
+    () => dht._addNodeFromNetwork(false, authority, authority),
+    () => dht._addNode(authority),
+    () => dht._removeStaleNode(authority, 0),
+    () => dht._removeNode(authority),
+    () => dht._onwakeup(),
+    () => dht._onfullrow(authority, authority),
+    () => dht._repingAndSwap(authority, authority),
+    () => dht._pingSome(),
+    () => dht._check(authority)
+  ]) {
+    const error = syncError(invoke)
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  }
+
+  for (const invoke of [
+    () => dht._updateNetworkState(),
+    () => dht._addBootstrapNodes(authority),
+    () => dht._checkIfFirewalled(authority),
+    () => dht._resolveBootstrapNodes().next()
+  ]) {
+    const error = await callError(invoke)
+    t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  }
+
+  const rawError = syncError(() =>
+    dht._request(
+      authority,
+      false,
+      false,
+      7,
+      null,
+      null,
+      null,
+      () => {},
+      () => {}
+    )
+  )
+  t.is(rawError && rawError.code, 'DIRECT_IO_FORBIDDEN')
+  t.is(transport.calls.request.length, 0)
+
+  await dht.query({ target: b4a.alloc(32, 1), command: 7 }, { concurrency: 1 }).finished()
+  t.is(transport.calls.request.length, 1)
+  t.is(transport.calls.request[0][0].to, destination)
+  await dht.destroy()
+})
+
+test('transport-only firewall checks fail closed without constructing direct state', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+
+  const error = await callError(() => dht._checkIfFirewalled())
+
+  t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+  t.is(dht._nat, null)
+  t.is(transport.calls.key.length, 0)
+  t.is(transport.calls.id.length, 0)
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+if (
+  require.cache &&
+  typeof require.resolve === 'function' &&
+  require.cache[require.resolve('..')] &&
+  require.cache[require.resolve('nat-sampler')]
+) {
+  test('transport-only checks the firewall guard before constructing its default NAT sampler', async (t) => {
+    const dhtPath = require.resolve('..')
+    const natSamplerPath = require.resolve('nat-sampler')
+    const cachedDHT = require.cache[dhtPath]
+    const cachedNatSampler = require.cache[natSamplerPath]
+    const NatSampler = cachedNatSampler.exports
+    let constructions = 0
+
+    cachedNatSampler.exports = class SpyNatSampler {
+      constructor() {
+        constructions++
+      }
+    }
+    delete require.cache[dhtPath]
+
+    let dht = null
+    try {
+      const GuardedDHT = require('..')
+      const transport = createTransport()
+      dht = new GuardedDHT({
+        outboundPolicy: 'transport-only',
+        requestTransport: transport
+      })
+
+      const error = await callError(() => dht._checkIfFirewalled())
+
+      t.is(error && error.code, 'DIRECT_IO_FORBIDDEN')
+      t.is(constructions, 0)
+      t.is(dht._nat, null)
+      t.is(transport.calls.request.length, 0)
+    } finally {
+      cachedNatSampler.exports = NatSampler
+      require.cache[dhtPath] = cachedDHT
+      if (dht !== null) await dht.destroy()
+    }
+  })
+}
+
+test('transport-only synthetic background opportunities stay adapter silent', async (t) => {
+  const transport = createTransport()
+  let factoryCalls = 0
+  const dht = new DHT({
+    outboundPolicy: 'transport-only',
+    requestTransport: transport,
+    udxFactory() {
+      factoryCalls++
+      throw new Error('transport-only constructed UDX')
+    }
+  })
+  const networkChanges = []
+  dht.on('network-change', (interfaces) => networkChanges.push(interfaces))
+
+  await dht.fullyBootstrapped()
+  for (let i = 0; i < 4; i++) {
+    dht._ontick()
+    dht._onnetworkchange([{ host: `synthetic-${i}` }])
+    await tick()
+  }
+
+  t.is(factoryCalls, 0)
+  t.is('_tickInterval' in dht, false)
+  t.is(networkChanges.length, 4)
+  t.is(transport.calls.ready.length, 1)
+  for (const calls of Object.values(transport.calls)) {
+    if (calls === transport.calls.ready) continue
+    t.is(calls.length, 0)
+  }
+
+  await dht.suspend()
+  await dht.resume()
+  await dht.destroy()
+  t.is(factoryCalls, 0)
+  t.is(transport.calls.suspend.length, 1)
+  t.is(transport.calls.resume.length, 1)
+  t.is(transport.calls.destroy.length, 1)
+})
+
+test('transport-only lifecycle and query never initialize UDX', async (t) => {
+  const destination = { ref: 'routed-seed' }
+  const transport = createOpaqueTransport({
+    bootstrap: [destination],
+    ids: opaqueIds([destination]),
+    request(message) {
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  let factoryCalls = 0
+  const dht = new DHT({
+    outboundPolicy: 'transport-only',
+    requestTransport: transport,
+    udxFactory() {
+      factoryCalls++
+      throw new Error('transport-only initialized UDX')
+    }
+  })
+
+  await dht.fullyBootstrapped()
+  await dht.query({ target: b4a.alloc(32, 1), command: 7 }, { concurrency: 1 }).finished()
+  await dht.suspend()
+  await dht.resume()
+  await dht.destroy()
+
+  t.is(factoryCalls, 0)
+  t.is(transport.calls.ready.length, 1)
+  t.is(transport.calls.bootstrap.length, 1)
+  t.is(transport.calls.request.length, 1)
+  t.is(transport.calls.request[0][0].internal, false)
+  t.is(transport.calls.request[0][0].command, 7)
+  t.is(transport.calls.suspend.length, 1)
+  t.is(transport.calls.resume.length, 1)
+  t.is(transport.calls.destroy.length, 1)
+  t.alike(dht.stats.commands, {
+    ping: { tx: 0, rx: 0 },
+    pingNat: { tx: 0, rx: 0 },
+    findNode: { tx: 0, rx: 0 },
+    downHint: { tx: 0, rx: 0 }
+  })
+})
+
 test('transport-only defaults routed request limits', (t) => {
   const dht = new DHT({
     outboundPolicy: 'transport-only',
@@ -839,6 +1392,7 @@ test('transport-only retries deterministically and cancels before retry', async 
     }
   })
   const dht = createTransportDHT(transport, { requestTimer: timer, requestTimeout: 1_000 })
+  const candidate = dht._queryCandidate(transport.destinations[0], new Map())
   const req = dht._request(
     transport.destinations[0],
     false,
@@ -848,7 +1402,9 @@ test('transport-only retries deterministically and cancels before retry', async 
     null,
     null,
     () => events.push('response'),
-    () => events.push('error')
+    () => events.push('error'),
+    null,
+    candidate
   )
   req.retries = 1
   req.oncycle = () => events.push(`cycle:${req.sent}`)
@@ -2471,6 +3027,9 @@ function manualTimer() {
     },
     clear(handle) {
       if (handle) pending.delete(handle.id)
+    },
+    size() {
+      return pending.size
     },
     advance(ms) {
       now += ms
