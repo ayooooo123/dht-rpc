@@ -2952,6 +2952,46 @@ test('transport-only query isolates auto commit from a shared session', async (t
   await dht.destroy()
 })
 
+test('direct query borrows a caller-owned session', async (t) => {
+  const dht = new DHT({ bootstrap: false })
+  const shared = dht.session()
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [{ host: '127.0.0.1', port: 1 }], session: shared, retries: 0 }
+  )
+  const finished = query.finished()
+  await waitFor(() => shared.inflight.length === 1)
+
+  t.is(query._session === shared, true)
+  t.is(shared.children.size, 0)
+
+  query.destroy()
+  await finished
+
+  t.is(shared.destroyed, false)
+  t.is(shared.inflight.length, 1, 'query teardown leaves caller-owned requests attached')
+  shared.destroy()
+  t.is(shared.inflight.length, 0)
+  await dht.destroy()
+})
+
+test('direct query cleans up its owned session', async (t) => {
+  const dht = new DHT({ bootstrap: false })
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [{ host: '127.0.0.1', port: 1 }], retries: 0 }
+  )
+  const owned = query._session
+  const finished = query.finished()
+  await waitFor(() => owned.inflight.length === 1)
+
+  query.destroy()
+  await finished
+
+  t.is(owned.inflight.length, 0)
+  await dht.destroy()
+})
+
 test('direct query candidates copy ids and freeze their dial descriptor', (t) => {
   const sourceId = b4a.alloc(32, 1)
   const source = { id: sourceId, host: '127.0.0.1', port: 1234 }
