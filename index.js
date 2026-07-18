@@ -8,10 +8,17 @@ const NatSampler = require('nat-sampler')
 const b4a = require('b4a')
 const NetworkHealth = require('./lib/health')
 const IO = require('./lib/io')
+const RequestTransport = require('./lib/request-transport')
 const Query = require('./lib/query')
 const Session = require('./lib/session')
 const peer = require('./lib/peer')
-const { UNKNOWN_COMMAND, INVALID_TOKEN } = require('./lib/errors')
+const {
+  UNKNOWN_COMMAND,
+  INVALID_TOKEN,
+  DIRECT_IO_FORBIDDEN,
+  TRANSPORT_INVALID,
+  TRANSPORT_INVALID_RESPONSE
+} = require('./lib/errors')
 const { PING, PING_NAT, FIND_NODE, DOWN_HINT, DELAYED_PING } = require('./lib/commands')
 
 const TMP = b4a.allocUnsafe(32)
@@ -29,14 +36,48 @@ const DEFAULTS = {
   maxPingDelay: 10_000
 }
 
+const TRANSPORT_DEFAULTS = {
+  requestTimeout: 1_000,
+  maxTransportCandidates: 256
+}
+
+const DIRECT_ONLY_OPTIONS = [
+  'bootstrap',
+  'nodes',
+  'udx',
+  'port',
+  'host',
+  'firewalled',
+  'anyPort',
+  'ephemeral',
+  'socket'
+]
+
 class DHT extends EventEmitter {
   constructor(opts = {}) {
     super()
 
+    this.outboundPolicy = validatePolicy(opts)
+
+    if (this.outboundPolicy === 'direct' && opts.requestTransport !== undefined) {
+      throw TRANSPORT_INVALID('requestTransport requires transport-only')
+    }
+
+    if (this.outboundPolicy === 'transport-only') {
+      for (const option of DIRECT_ONLY_OPTIONS) {
+        if (Object.prototype.hasOwnProperty.call(opts, option)) {
+          throw DIRECT_IO_FORBIDDEN(`${option} is unavailable with transport-only`)
+        }
+      }
+
+      this._initRequestTransport(opts)
+      return
+    }
+
     this.bootstrapNodes = opts.bootstrap === false ? [] : (opts.bootstrap || []).map(parseNode)
     this.table = new Table(randomBytes(32))
     this.nodes = new TOS()
-    this.udx = opts.udx || new UDX()
+    this.udx = opts.udx || (opts.udxFactory || defaultUDXFactory)()
     this.io = new IO(this.table, this.udx, {
       ...opts,
       onrequest: this._onrequest.bind(this),
@@ -99,9 +140,63 @@ class DHT extends EventEmitter {
     }
   }
 
+  _initRequestTransport(opts) {
+    this.requestTimeout = validatePositiveInteger(
+      opts.requestTimeout,
+      TRANSPORT_DEFAULTS.requestTimeout,
+      'requestTimeout'
+    )
+    this.maxTransportCandidates = validateIntegerRange(
+      opts.maxTransportCandidates,
+      TRANSPORT_DEFAULTS.maxTransportCandidates,
+      20,
+      4096,
+      'maxTransportCandidates'
+    )
+
+    this.bootstrapNodes = []
+    this.table = null
+    this.nodes = null
+    this.udx = null
+    this.io = new RequestTransport(opts.requestTransport, {
+      requestTimeout: this.requestTimeout,
+      maxTransportCandidates: this.maxTransportCandidates,
+      requestTimer: opts.requestTimer,
+      ontransporterror: (error) => this.emit('transport-error', error)
+    })
+    this.health = null
+
+    this.concurrency = opts.concurrency || DEFAULTS.concurrency
+    this.maxPingDelay = opts.maxPingDelay || DEFAULTS.maxPingDelay
+    this.bootstrapped = false
+    this.ephemeral = true
+    this.firewalled = true
+    this.destroyed = false
+    this.suspended = false
+    this.online = true
+    this.degraded = false
+    this.stats = {
+      queries: { active: 0, total: 0 },
+      requests: this.io.stats.requests,
+      commands: {
+        ping: this.io.stats.commands[PING],
+        pingNat: this.io.stats.commands[PING_NAT],
+        findNode: this.io.stats.commands[FIND_NODE],
+        downHint: this.io.stats.commands[DOWN_HINT]
+      }
+    }
+
+    this._nat = null
+    this._queryId = randomBytes(32)
+    this._queryK = 20
+    this._bootstrapping = this._bootstrap()
+    this._bootstrapping.catch(noop)
+  }
+
   static DEFAULTS = DEFAULTS
 
   static bootstrapper(port, host, opts) {
+    if (opts && opts.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!port) throw new Error('Port is required')
     if (!host) throw new Error('Host is required')
     if (host === '0.0.0.0' || host === '::') throw new Error('Invalid host')
@@ -120,26 +215,41 @@ class DHT extends EventEmitter {
   }
 
   get id() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this.ephemeral ? null : this.table.id
   }
 
   get host() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this._nat.host
   }
 
   get port() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this._nat.port
   }
 
   get randomized() {
+    if (this.outboundPolicy === 'transport-only') return false
     return this._nat.host !== null && this._nat.port === 0
   }
 
   get socket() {
+    if (this.outboundPolicy === 'transport-only') return null
     return this.firewalled ? this.io.clientSocket : this.io.serverSocket
   }
 
   get config() {
+    if (this.outboundPolicy === 'transport-only') {
+      return {
+        concurrency: this.concurrency,
+        maxPingDelay: this.maxPingDelay,
+        outboundPolicy: this.outboundPolicy,
+        requestTimeout: this.requestTimeout,
+        maxTransportCandidates: this.maxTransportCandidates
+      }
+    }
+
     return {
       concurrency: this.concurrency,
       maxWindow: this.io.congestion._maxWindow,
@@ -151,14 +261,23 @@ class DHT extends EventEmitter {
   }
 
   onmessage(socket, buf, rinfo) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (buf.byteLength > 1) this.io.onmessage(socket, buf, rinfo)
   }
 
   bind() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     return this.io.bind()
   }
 
   async suspend({ log = noop } = {}) {
+    if (this.outboundPolicy === 'transport-only') {
+      if (this.destroyed) return
+      await this.io.suspend()
+      this._syncTransportSuspension()
+      return
+    }
+
     log('Suspending waiting for io bind...')
     await this.io.bind()
     log('Done, continuing')
@@ -172,6 +291,13 @@ class DHT extends EventEmitter {
   }
 
   async resume({ log = noop } = {}) {
+    if (this.outboundPolicy === 'transport-only') {
+      if (this.destroyed) return
+      await this.io.resume()
+      this._syncTransportSuspension()
+      return
+    }
+
     if (!this.suspended || this.destroyed) return
     this.suspended = false
     this._tickInterval = setInterval(this._ontick.bind(this), TICK_INTERVAL)
@@ -184,12 +310,19 @@ class DHT extends EventEmitter {
     this.emit('resume')
   }
 
+  _syncTransportSuspension() {
+    if (this.destroyed || this.suspended === this.io.suspended) return
+    this.suspended = this.io.suspended
+    this.emit(this.suspended ? 'suspend' : 'resume')
+  }
+
   address() {
     const socket = this.socket
     return socket ? socket.address() : null
   }
 
   localAddress() {
+    if (this.outboundPolicy === 'transport-only') return null
     if (!this.io.serverSocket) return null
 
     return {
@@ -199,6 +332,7 @@ class DHT extends EventEmitter {
   }
 
   remoteAddress() {
+    if (this.outboundPolicy === 'transport-only') return null
     if (!this.host) return null
     if (!this.port) return null
     if (this.firewalled) return null
@@ -213,7 +347,9 @@ class DHT extends EventEmitter {
     }
   }
 
-  addNode({ host, port }) {
+  addNode(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
+    const { host, port } = node
     this._addNode({
       id: peer.id(host, port),
       port,
@@ -231,6 +367,7 @@ class DHT extends EventEmitter {
   }
 
   toArray(opts) {
+    if (this.outboundPolicy === 'transport-only') return []
     const limit = opts && opts.limit
     if (limit === 0) return []
     return this.nodes.toArray({ limit, reverse: true }).map(({ host, port }) => ({ host, port }))
@@ -247,20 +384,124 @@ class DHT extends EventEmitter {
 
   findNode(target, opts) {
     if (this.destroyed) throw new Error('Node destroyed')
-    this._refreshTicks = REFRESH_TICKS
+    if (opts && opts.session && opts.session.destroyed) throw opts.session.error
+    if (this.outboundPolicy === 'direct') this._refreshTicks = REFRESH_TICKS
     return new Query(this, target, true, FIND_NODE, null, opts)
   }
 
   query({ target, command, value }, opts) {
     if (this.destroyed) throw new Error('Node destroyed')
-    this._refreshTicks = REFRESH_TICKS
+    if (opts && opts.session && opts.session.destroyed) throw opts.session.error
+    if (this.outboundPolicy === 'direct') this._refreshTicks = REFRESH_TICKS
     return new Query(this, target, false, command, value || null, opts)
   }
 
-  ping({ host, port }, opts) {
+  _nodeKey(node) {
+    return node.key
+  }
+
+  _nodeId(node) {
+    return node.id
+  }
+
+  _queryCandidate(destination, registry, added = null) {
+    if (this.outboundPolicy === 'direct') {
+      const sourceId = destination.id || peer.id(destination.host, destination.port)
+      const { id, destinationId } = copyDirectIds(sourceId)
+      const directDestination = Object.freeze({
+        id: destinationId,
+        host: destination.host,
+        port: destination.port
+      })
+      return Object.freeze({
+        destination: directDestination,
+        key: destination.host + ':' + destination.port,
+        id
+      })
+    }
+
+    return this._registerQueryCandidate(this.io.createCandidate(destination, true), registry, added)
+  }
+
+  _registerQueryCandidate(candidate, registry, added = null) {
+    const identity = this.io._candidateIdentity(candidate, true)
+    const previous = registry.get(identity.key)
+
+    if (previous !== undefined) {
+      const previousIdentity = this.io._candidateIdentity(previous, true)
+      if (!b4a.equals(previousIdentity.id, identity.id)) throw TRANSPORT_INVALID_RESPONSE()
+      return candidate
+    }
+    if (registry.size >= this.maxTransportCandidates) throw TRANSPORT_INVALID_RESPONSE()
+
+    registry.set(identity.key, candidate)
+    if (added !== null) added.push(identity.key)
+    return candidate
+  }
+
+  _closestQueryNodes(target, limit, registry, added = null, context = null) {
+    if (this.outboundPolicy === 'direct') {
+      const closest = this.table.closest(target, limit)
+      return closest.map((node) =>
+        this._queryCandidate({ id: node.id, host: node.host, port: node.port }, registry)
+      )
+    }
+
+    let closest = null
+    try {
+      closest = this.io.closest({ target, limit, context })
+      if (closest === null || closest === undefined) throw TRANSPORT_INVALID_RESPONSE()
+      const candidates = []
+      if (limit <= 0) return candidates
+      for (const destination of closest) {
+        candidates.push(this._queryCandidate(destination, registry, added))
+        if (candidates.length >= limit) break
+      }
+      return candidates
+    } catch (error) {
+      if (error && error.code === 'TRANSPORT_INVALID_RESPONSE') throw error
+      throw TRANSPORT_INVALID_RESPONSE()
+    }
+  }
+
+  async *_resolveQueryBootstrap(target, limit, registry, added = null, context = null) {
+    if (this.outboundPolicy === 'direct') {
+      for await (const node of this._resolveBootstrapNodes()) {
+        yield this._queryCandidate(node, registry)
+      }
+      return
+    }
+
+    let bootstrap = null
+    try {
+      bootstrap = await this.io.bootstrap({ target, limit, context })
+      if (bootstrap === null || bootstrap === undefined) throw TRANSPORT_INVALID_RESPONSE()
+      if (limit <= 0) return
+      let count = 0
+      for await (const destination of bootstrap) {
+        yield this._queryCandidate(destination, registry, added)
+        if (++count >= limit) break
+      }
+    } catch (error) {
+      if (error && error.code === 'TRANSPORT_INVALID_RESPONSE') throw error
+      throw TRANSPORT_INVALID_RESPONSE()
+    }
+  }
+
+  ping(to, opts) {
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+      const value = opts && opts.size && opts.size > 0 ? b4a.alloc(opts.size) : null
+      return this._transportRequestToPromise(to, null, true, PING, null, value, opts, 0, null, null)
+    }
+
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     let value = null
 
     if (opts && opts.size && opts.size > 0) value = b4a.alloc(opts.size)
+
+    const { host, port } = to
 
     const req = this.io.createRequest(
       { id: null, host, port },
@@ -275,13 +516,39 @@ class DHT extends EventEmitter {
     return this._requestToPromise(req, opts)
   }
 
-  delayedPing({ host, port }, delayMs, opts) {
+  delayedPing(to, delayMs, opts) {
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+      if (delayMs > this.maxPingDelay) {
+        throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
+      }
+
+      const value = b4a.allocUnsafe(4)
+      c.uint32.encode({ start: 0, end: 4, buffer: value }, delayMs)
+      return this._transportRequestToPromise(
+        to,
+        null,
+        true,
+        DELAYED_PING,
+        null,
+        value,
+        opts,
+        delayMs + 1_000,
+        null,
+        null
+      )
+    }
+
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
     if (delayMs > this.maxPingDelay) {
       throw new Error(`Delay exceeds max delay: ${this.maxPingDelay}ms`)
     }
 
     const value = b4a.allocUnsafe(4)
     c.uint32.encode({ start: 0, end: 4, buffer: value }, delayMs)
+
+    const { host, port } = to
 
     const req = this.io.createRequest(
       { id: null, host, port },
@@ -314,6 +581,8 @@ class DHT extends EventEmitter {
       }
     }
 
+    if (this.outboundPolicy === 'transport-only') return stats
+
     if (this.nodes.latest) {
       const q = this.findNode(this.nodes.latest.id)
 
@@ -345,7 +614,29 @@ class DHT extends EventEmitter {
     return stats
   }
 
-  request({ token = null, command, target = null, value = null }, { host, port }, opts) {
+  request(message, to, opts) {
+    if (this.outboundPolicy === 'transport-only') {
+      forbidDirectRequestOptions(opts)
+      const { token = null, command, target = null, value = null } = message
+      if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+      const transportContext = opts ? opts.transportContext : null
+      return this._transportRequestToPromise(
+        to,
+        token,
+        false,
+        command,
+        target,
+        value,
+        opts,
+        0,
+        null,
+        transportContext === undefined ? null : transportContext
+      )
+    }
+
+    const { token = null, command, target = null, value = null } = message
+    if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+    const { host, port } = to
     const req = this.io.createRequest(
       { id: null, host, port },
       token,
@@ -376,10 +667,76 @@ class DHT extends EventEmitter {
     })
   }
 
+  _transportRequestToPromise(
+    to,
+    token,
+    internal,
+    command,
+    target,
+    value,
+    opts,
+    timeout = 0,
+    candidate = null,
+    context = null
+  ) {
+    let req = null
+    try {
+      req = this.io.createRequest(
+        to,
+        token,
+        internal,
+        command,
+        target,
+        value,
+        (opts && opts.session) || null,
+        candidate,
+        context
+      )
+    } catch (error) {
+      return Promise.reject(error)
+    }
+
+    if (req !== null && timeout > 0) req.timeout = timeout
+    return this._requestToPromise(req, opts)
+  }
+
+  _queryCandidateRequest(
+    { token = null, command, target = null, value = null },
+    candidate,
+    opts,
+    context = null
+  ) {
+    if (this.outboundPolicy === 'direct') {
+      return this.request({ token, command, target, value }, candidate.destination, opts)
+    }
+    return this._transportRequestToPromise(
+      candidate.destination,
+      token,
+      false,
+      command,
+      target,
+      value,
+      opts,
+      0,
+      candidate,
+      context
+    )
+  }
+
   async _bootstrap() {
     const self = this
 
     await Promise.resolve() // wait a tick, so apis can be used from the outside
+
+    if (this.outboundPolicy === 'transport-only') {
+      if (this.destroyed) return
+      await this.io.ready()
+      if (this.destroyed) return
+      this.bootstrapped = true
+      this.emit('ready')
+      return
+    }
+
     await this.io.bind()
 
     this.emit('listening')
@@ -433,6 +790,7 @@ class DHT extends EventEmitter {
   }
 
   refresh() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     const node = this.table.random()
     this._backgroundQuery(node ? node.id : this.table.id).on('error', noop)
   }
@@ -440,6 +798,13 @@ class DHT extends EventEmitter {
   async destroy() {
     const emitClose = !this.destroyed
     this.destroyed = true
+
+    if (this.outboundPolicy === 'transport-only') {
+      await this.io.destroy()
+      if (emitClose) this.emit('close')
+      return
+    }
+
     clearInterval(this._tickInterval)
     for (const timer of this._pendingTimers) {
       clearTimeout(timer)
@@ -448,19 +813,58 @@ class DHT extends EventEmitter {
     if (emitClose) this.emit('close')
   }
 
-  _request(to, force, internal, command, target, value, session, onresponse, onerror) {
+  _request(
+    to,
+    force,
+    internal,
+    command,
+    target,
+    value,
+    session,
+    onresponse,
+    onerror,
+    configure,
+    candidate = null,
+    context = null
+  ) {
+    if (this.outboundPolicy === 'transport-only') {
+      if (candidate === null) throw DIRECT_IO_FORBIDDEN()
+      this.io._candidateIdentity(candidate, false, to)
+      if (session && session.destroyed) return null
+      const req = this.io.createRequest(
+        to,
+        null,
+        internal,
+        command,
+        target,
+        value,
+        session,
+        candidate,
+        context
+      )
+      if (req === null) return null
+      req.onresponse = onresponse
+      req.onerror = onerror
+      if (configure) configure(req)
+      req.send(force)
+      return req
+    }
+
     if (internal && !this._sendDownHints && command === DOWN_HINT) return null
+    if (session && session.destroyed) return null
     const req = this.io.createRequest(to, null, internal, command, target, value, session)
     if (req === null) return null
 
     req.onresponse = onresponse
     req.onerror = onerror
+    if (configure) configure(req)
     req.send(force)
 
     return req
   }
 
   _natAdd(host, port) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     const prevHost = this._nat.host
     const prevPort = this._nat.port
 
@@ -473,6 +877,7 @@ class DHT extends EventEmitter {
 
   // we don't check that this is a bootstrap node but we limit the sample size to very few nodes, so fine
   _sampleBootstrapMaybe(from, to) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (this._nonePersistentSamples.length >= Math.max(1, this.bootstrapNodes.length)) return
     const id = from.host + ':' + from.port
     if (this._nonePersistentSamples.indexOf(id) > -1) return
@@ -481,6 +886,7 @@ class DHT extends EventEmitter {
   }
 
   _addNodeFromNetwork(sample, from, to) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (this._filterNode !== null && !this._filterNode(from)) {
       return
     }
@@ -521,6 +927,7 @@ class DHT extends EventEmitter {
   }
 
   _addNode(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (this.nodes.has(node) || b4a.equals(node.id, this.table.id)) return
 
     node.added = node.pinged = node.seen = this._tick
@@ -537,10 +944,12 @@ class DHT extends EventEmitter {
   }
 
   _removeStaleNode(node, lastSeen) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (node.seen <= lastSeen) this._removeNode(node)
   }
 
   _removeNode(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!this.nodes.has(node)) return
 
     this.table.remove(node.id)
@@ -550,6 +959,7 @@ class DHT extends EventEmitter {
   }
 
   _onwakeup() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     this._tick += 2 * OLD_NODE // bump the tick enough that everything appears old.
     this._tick += 8 - (this._tick & 7) - 2 // triggers a series of pings in two ticks
     this._stableTicks = MORE_STABLE_TICKS
@@ -573,6 +983,7 @@ class DHT extends EventEmitter {
   }
 
   _onfullrow(newNode, row) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!this.bootstrapped || this._repinging >= 3) return
 
     let oldest = null
@@ -599,6 +1010,7 @@ class DHT extends EventEmitter {
   }
 
   _repingAndSwap(newNode, oldNode) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     const self = this
     const lastSeen = oldNode.seen
 
@@ -630,6 +1042,7 @@ class DHT extends EventEmitter {
   }
 
   _onrequest(req, external) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (req.from.id !== null) {
       this._addNodeFromNetwork(!external, req.from, req.to)
     }
@@ -687,10 +1100,12 @@ class DHT extends EventEmitter {
   }
 
   onrequest(req) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     return this.emit('request', req)
   }
 
   _ondelayedping(req) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (req.value === null || req.value.byteLength < 4) return
     const delayMs = c.uint32.decode({ start: 0, end: 4, buffer: req.value })
     if (delayMs > this.maxPingDelay) return
@@ -703,16 +1118,19 @@ class DHT extends EventEmitter {
   }
 
   _onresponse(res, external) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     this._addNodeFromNetwork(!external, res.from, res.to)
   }
 
   _ontimeout(req) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!req.to.id) return
     const node = this.table.get(req.to.id)
     if (node) this._removeNode(node)
   }
 
   _pingSome() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     let cnt = this.io.inflight.length > 2 ? 3 : 5
     let oldest = this.nodes.oldest
 
@@ -735,6 +1153,7 @@ class DHT extends EventEmitter {
   }
 
   _check(node) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     node.pinged = this._tick
 
     const lastSeen = node.seen
@@ -762,6 +1181,7 @@ class DHT extends EventEmitter {
   }
 
   _ontick() {
+    if (this.outboundPolicy === 'transport-only') return
     const time = Date.now()
 
     if (time - this._lastTick > SLEEPING_INTERVAL && this.suspended === false) {
@@ -799,6 +1219,7 @@ class DHT extends EventEmitter {
   }
 
   async _updateNetworkState(onlyFirewall = false) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     if (!this.ephemeral) return false
     if (onlyFirewall && !this.firewalled) return false
 
@@ -875,6 +1296,7 @@ class DHT extends EventEmitter {
   }
 
   async *_resolveBootstrapNodes() {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     for (let { host, port } of this.bootstrapNodes) {
       let doLookup = false
 
@@ -908,12 +1330,15 @@ class DHT extends EventEmitter {
   }
 
   async _addBootstrapNodes(nodes) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     for await (const node of this._resolveBootstrapNodes()) {
       nodes.push(node)
     }
   }
 
-  async _checkIfFirewalled(natSampler = new NatSampler()) {
+  async _checkIfFirewalled(natSampler) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
+    if (natSampler === undefined) natSampler = new NatSampler()
     const nodes = []
     for (let node = this.nodes.latest; node && nodes.length < 5; node = node.prev) {
       nodes.push(node)
@@ -963,6 +1388,7 @@ class DHT extends EventEmitter {
   }
 
   _backgroundQuery(target) {
+    if (this.outboundPolicy === 'transport-only') throw DIRECT_IO_FORBIDDEN()
     this._refreshTicks = REFRESH_TICKS
 
     const backgroundCon = Math.min(this.concurrency, Math.max(2, (this.concurrency / 8) | 0))
@@ -1045,6 +1471,54 @@ function randomBytes(n) {
 
 function randomOffset(n) {
   return n - ((Math.random() * 0.5 * n) | 0)
+}
+
+function copyDirectIds(source) {
+  try {
+    if (!b4a.isBuffer(source) || source.byteLength !== 32) throw new Error()
+    const id = b4a.from(source)
+    if (!b4a.isBuffer(id) || id.byteLength !== 32) throw new Error()
+    const destinationId = b4a.from(id)
+    if (!b4a.isBuffer(destinationId) || destinationId.byteLength !== 32) throw new Error()
+    return { id, destinationId }
+  } catch {
+    throw new Error('Invalid direct node id')
+  }
+}
+
+function defaultUDXFactory() {
+  return new UDX()
+}
+
+function validatePolicy(opts) {
+  const policy = opts.outboundPolicy === undefined ? 'direct' : opts.outboundPolicy
+  if (policy !== 'direct' && policy !== 'transport-only') {
+    throw TRANSPORT_INVALID('Unknown outboundPolicy')
+  }
+  return policy
+}
+
+function validatePositiveInteger(value, defaultValue, name) {
+  if (value === undefined) return defaultValue
+  if (!Number.isInteger(value) || value <= 0) throw TRANSPORT_INVALID(`Invalid ${name}`)
+  return value
+}
+
+function validateIntegerRange(value, defaultValue, min, max, name) {
+  if (value === undefined) return defaultValue
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw TRANSPORT_INVALID(`Invalid ${name}`)
+  }
+  return value
+}
+
+function forbidDirectRequestOptions(opts) {
+  if (!opts) return
+  for (const option of ['socket', 'ttl']) {
+    if (Object.prototype.hasOwnProperty.call(opts, option)) {
+      throw DIRECT_IO_FORBIDDEN(`${option} is unavailable with transport-only`)
+    }
+  }
 }
 
 function requestAll(dht, internal, command, value, nodes) {

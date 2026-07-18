@@ -634,10 +634,8 @@ test('filter nodes from routing table', async function (t) {
   t.absent(node.table.has(b.id), 'should not have b')
 })
 
-test('request session, destroy all', async function (t) {
+test('request session, destroy all and reuse', async function (t) {
   const [, a, b] = await makeSwarm(3, t)
-
-  a.on('request', () => t.fail())
 
   const s = b.session()
   const p = [s.request({ command: 42 }, a), s.request({ command: 42 }, a)]
@@ -650,6 +648,9 @@ test('request session, destroy all', async function (t) {
     t.is(status, 'rejected')
     t.is(reason, err)
   }
+
+  const pong = await s.ping(a)
+  t.is(pong.from.port, a.port)
 })
 
 test('close event', async function (t) {
@@ -1365,3 +1366,5 @@ function createDHT(opts) {
 function createBootstrapper(port, opts) {
   return DHT.bootstrapper(port, '127.0.0.1', { ...opts, host: '127.0.0.1' })
 }
+
+require('./test/request-transport')

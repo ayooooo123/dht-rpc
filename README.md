@@ -15,6 +15,116 @@ npm install dht-rpc
 Note that internally V5 of dht-rpc differs significantly from V4, due to a series
 of improvements to NAT detection, secure routing IDs and more.
 
+## Experimental request transports
+
+The `private-routing-v1` branch has an experimental, generic request-transport
+hook. Direct UDP remains the default. To make DHT-RPC fail closed instead, select
+`transport-only` and provide the complete adapter:
+
+```js
+const dht = new DHT({
+  outboundPolicy: 'transport-only',
+  requestTransport,
+  requestTimeout: 1000,
+  maxTransportCandidates: 256
+})
+```
+
+`transport-only` never constructs UDX, binds a UDP socket, watches network
+interfaces, samples NAT state, or starts direct background traffic. Direct-only
+constructor options and mutating or direct-I/O entrypoints fail with
+`DIRECT_IO_FORBIDDEN`; there is no automatic downgrade to direct transport.
+Inert state accessors do not attempt I/O: `id`, `host`, `port`, `socket`,
+`address()`, `localAddress()`, and `remoteAddress()` return `null`, `randomized`
+returns `false`, and `toArray()` returns `[]`.
+
+The adapter contract is:
+
+```text
+RequestTransport {
+  ready()
+  suspend()
+  resume()
+  destroy()
+  bootstrap({ target, limit })
+  closest({ target, limit })
+  key(destination)
+  id(destination)
+  request({ to, token, internal, command, target, value, attempt })
+}
+```
+
+Lifecycle methods may return promises. `bootstrap()` returns a promise or async
+iterable of destinations, while `closest()` returns an iterable of locally known
+destinations. A destination is opaque to DHT-RPC: it may be `{ id, ref }`, and
+does not need `host` or `port`. `key(destination)` must return a stable
+adapter-scoped string and `id(destination)` must return a 32-byte,
+`b4a`-compatible identifier.
+
+Each `request()` call represents one attempt and must return:
+
+```text
+RequestOperation {
+  promise
+  cancel(reason)
+}
+```
+
+The promise resolves to the existing logical reply shape:
+
+```text
+LogicalReply {
+  rtt
+  from
+  to
+  token
+  closerNodes
+  error
+  value
+}
+```
+
+DHT-RPC owns retries, per-attempt timeouts, cancellation, session/query
+attachment, bootstrap readiness, lifecycle ordering, statistics, and
+exactly-once terminal callbacks. Superseded, suspended, destroyed, and
+session-cancelled attempts call `cancel(reason)` exactly once; late settlements
+are ignored. Adapter request throws and rejections consume the retry budget and
+finish as `TRANSPORT_UNAVAILABLE`; wrapper timeouts finish as `REQUEST_TIMEOUT`.
+A malformed request operation finishes as `TRANSPORT_INVALID` and is not
+retried.
+
+Before query state changes, DHT-RPC validates and copies every adapter identity,
+then rejects malformed replies, identity collisions, and capacity overflow with
+`TRANSPORT_INVALID_RESPONSE`. A logical reply requires non-negative integer
+`rtt` and `error` values plus an object `from`; omitted `to`, `token`,
+`closerNodes`, and `value` fields normalize to `null`. Each query has a key-to-ID
+registry capped by `maxTransportCandidates` (default `256`, valid range
+`20..4096`) shared by caller seeds, `closest()`, `bootstrap()`, reply senders, and
+closer nodes. A standalone request retains its destination identity and validates
+each response atomically in a temporary registry capped at 21 identities: one
+sender and at most 20 closer nodes. Registries are cleared when their operation
+ends. Public results unwrap the original opaque destinations; copied IDs are used
+only for Kademlia ordering and validation.
+
+This seam does **not** provide anonymity by itself. The adapter must supply the
+private routing, cryptography, traffic-analysis defenses, and destination
+authentication. The planned HyperDHT consumer and its security boundary are
+documented in [private-routing-v1](https://github.com/ayooooo123/hyperdht/blob/private-routing-v1/docs/private-routing-v1.md).
+
+For local fork development, keep the npm dependency name and point it at the Git
+branch:
+
+```json
+{
+  "dependencies": {
+    "dht-rpc": "github:ayooooo123/dht-rpc#private-routing-v1"
+  }
+}
+```
+
+Replace the branch with a reviewed commit SHA for reproducible builds. Do not
+publish or import this fork under a different npm package name.
+
 ## Usage
 
 Here is an example implementing a simple key value store

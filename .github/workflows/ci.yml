@@ -3,9 +3,11 @@ on:
   push:
     tags:
       - '*'
-    branches: [main]
+    branches: [main, private-routing-v1]
   pull_request:
-    branches: [main]
+    branches: [main, private-routing-v1]
+permissions:
+  contents: read
 jobs:
   lint:
     runs-on: ubuntu-latest
