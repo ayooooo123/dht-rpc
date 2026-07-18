@@ -2275,35 +2275,33 @@ test('transport-only session ping excludes transport context capability', async 
   t.is('transportContext' in forwarded, false)
 })
 
-test('destroyed session ping wins without reading transport context', async (t) => {
+test('destroyed transport session ping wins without reading transport context', async (t) => {
   const Session = require('../lib/session')
 
-  for (const outboundPolicy of ['direct', 'transport-only']) {
-    const terminal = new Error(`${outboundPolicy} session closed`)
-    let contextReads = 0
-    let pingCalls = 0
-    const dht = {
-      outboundPolicy,
-      ping() {
-        pingCalls++
-        return Promise.resolve()
-      }
+  const terminal = new Error('transport-only session closed')
+  let contextReads = 0
+  let pingCalls = 0
+  const dht = {
+    outboundPolicy: 'transport-only',
+    ping() {
+      pingCalls++
+      return Promise.resolve()
     }
-    const session = new Session(dht)
-    session.destroy(terminal)
-    const opts = {}
-    Object.defineProperty(opts, 'transportContext', {
-      enumerable: true,
-      get() {
-        contextReads++
-        throw new Error('destroyed session ping read transport context')
-      }
-    })
-
-    t.is(await promiseError(session.ping({ ref: 'destination' }, opts)), terminal)
-    t.is(contextReads, 0)
-    t.is(pingCalls, 0)
   }
+  const session = new Session(dht)
+  session.destroy(terminal)
+  const opts = {}
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('destroyed session ping read transport context')
+    }
+  })
+
+  t.is(await promiseError(session.ping({ ref: 'destination' }, opts)), terminal)
+  t.is(contextReads, 0)
+  t.is(pingCalls, 0)
 })
 
 test('session query and request preserve explicit null options', async (t) => {
@@ -3345,39 +3343,37 @@ test('transport-only seed identity cannot activate a query after closing its par
   await dht.destroy()
 })
 
-test('direct and transport public APIs preserve closed session terminals', async (t) => {
+test('transport public APIs preserve closed session terminals', async (t) => {
   const Session = require('../lib/session')
-  for (const outboundPolicy of ['direct', 'transport-only']) {
-    const terminal = new Error(`${outboundPolicy} closed`)
-    const dht = Object.create(DHT.prototype)
-    dht.destroyed = false
-    dht.outboundPolicy = outboundPolicy
-    const session = new Session(dht)
-    session.destroy(terminal)
-    const destination = { host: '127.0.0.1', port: 1 }
+  const terminal = new Error('transport-only closed')
+  const dht = Object.create(DHT.prototype)
+  dht.destroyed = false
+  dht.outboundPolicy = 'transport-only'
+  const session = new Session(dht)
+  session.destroy(terminal)
+  const destination = { host: '127.0.0.1', port: 1 }
 
-    t.is(
-      await promiseError(dht.request({ command: 7 }, destination, { session })),
-      terminal,
-      `${outboundPolicy} request`
-    )
-    t.is(await promiseError(dht.ping(destination, { session })), terminal, `${outboundPolicy} ping`)
-    t.is(
-      await promiseError(dht.delayedPing(destination, 1, { session })),
-      terminal,
-      `${outboundPolicy} delayed ping`
-    )
-    t.is(
-      syncError(() => dht.query({ target: b4a.alloc(32), command: 7 }, { session })),
-      terminal,
-      `${outboundPolicy} query`
-    )
-    t.is(
-      syncError(() => dht.findNode(b4a.alloc(32), { session })),
-      terminal,
-      `${outboundPolicy} find node`
-    )
-  }
+  t.is(
+    await promiseError(dht.request({ command: 7 }, destination, { session })),
+    terminal,
+    'transport-only request'
+  )
+  t.is(await promiseError(dht.ping(destination, { session })), terminal, 'transport-only ping')
+  t.is(
+    await promiseError(dht.delayedPing(destination, 1, { session })),
+    terminal,
+    'transport-only delayed ping'
+  )
+  t.is(
+    syncError(() => dht.query({ target: b4a.alloc(32), command: 7 }, { session })),
+    terminal,
+    'transport-only query'
+  )
+  t.is(
+    syncError(() => dht.findNode(b4a.alloc(32), { session })),
+    terminal,
+    'transport-only find node'
+  )
 })
 
 test('query configures retries and cycles before DHT sends', (t) => {

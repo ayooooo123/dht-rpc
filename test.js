@@ -634,7 +634,7 @@ test('filter nodes from routing table', async function (t) {
   t.absent(node.table.has(b.id), 'should not have b')
 })
 
-test('request session, destroy all', async function (t) {
+test('request session, destroy all and reuse', async function (t) {
   const [, a, b] = await makeSwarm(3, t)
 
   const s = b.session()
@@ -648,6 +648,9 @@ test('request session, destroy all', async function (t) {
     t.is(status, 'rejected')
     t.is(reason, err)
   }
+
+  const pong = await s.ping(a)
+  t.is(pong.from.port, a.port)
 })
 
 test('close event', async function (t) {
