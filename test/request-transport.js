@@ -2117,6 +2117,80 @@ test('transport-only session request snapshots an inherited transport context', 
   t.is(forwarded.session, session)
 })
 
+test('transport-only session query stops before context when an option closes it', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const session = dht.session()
+  const terminal = new Error('query option closed session')
+  let optionReads = 0
+  let contextReads = 0
+  const opts = {}
+  Object.defineProperty(opts, 'concurrency', {
+    enumerable: true,
+    get() {
+      optionReads++
+      session.destroy(terminal)
+      return 1
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('closed query read transport context')
+    }
+  })
+
+  const error = syncError(() => session.query({ target: b4a.alloc(32), command: 7 }, opts))
+
+  t.is(error, terminal)
+  t.is(optionReads, 1)
+  t.is(contextReads, 0)
+  for (const method of ['closest', 'bootstrap', 'key', 'id', 'request']) {
+    t.is(transport.calls[method].length, 0, `${method} stays idle`)
+  }
+  await dht.destroy()
+})
+
+test('transport-only session request rejects before context when an option closes it', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const session = dht.session()
+  const terminal = new Error('request option closed session')
+  let optionReads = 0
+  let contextReads = 0
+  const opts = {}
+  Object.defineProperty(opts, 'retry', {
+    enumerable: true,
+    get() {
+      optionReads++
+      session.destroy(terminal)
+      return false
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('closed request read transport context')
+    }
+  })
+  let result = null
+  const synchronous = syncError(() => {
+    result = session.request({ command: 7 }, transport.destinations[0], opts)
+  })
+
+  t.is(synchronous, null)
+  t.is(result && typeof result.then, 'function')
+  t.is(result && (await promiseError(result)), terminal)
+  t.is(optionReads, 1)
+  t.is(contextReads, 0)
+  for (const method of ['closest', 'bootstrap', 'key', 'id', 'request']) {
+    t.is(transport.calls[method].length, 0, `${method} stays idle`)
+  }
+  await dht.destroy()
+})
+
 test('direct session ping skips an enumerable transport context', async (t) => {
   const Session = require('../lib/session')
   const marker = Symbol('marker')
