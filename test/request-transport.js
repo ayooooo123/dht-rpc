@@ -1625,6 +1625,7 @@ test('transport-only session request and ping preserve opaque destinations', asy
   const ping = session.ping(to, { retry: false })
   await tick()
   t.is(transport.calls.request[1][0].to, to)
+  t.is(transport.calls.request[1][0].context, null)
   transport.requests[1].resolve(validReply(transport.destinations[1]))
   await ping
 
@@ -2114,6 +2115,121 @@ test('transport-only session request snapshots an inherited transport context', 
   t.is(forwarded.ttl, 9)
   t.is(forwarded.transportContext, context)
   t.is(forwarded.session, session)
+})
+
+test('direct session ping skips an enumerable transport context', async (t) => {
+  const Session = require('../lib/session')
+  const marker = Symbol('marker')
+  let forwarded = null
+  let contextReads = 0
+  let optionReads = 0
+  const reply = { ok: true }
+  const dht = {
+    outboundPolicy: 'direct',
+    ping(to, opts) {
+      forwarded = opts
+      return Promise.resolve(reply)
+    }
+  }
+  const session = new Session(dht)
+  const opts = { retry: false, session: { wrong: true } }
+  Object.defineProperty(opts, 'ttl', {
+    enumerable: true,
+    get() {
+      optionReads++
+      return 9
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('direct session ping read transport context')
+    }
+  })
+  opts[marker] = 'kept'
+
+  t.is(await session.ping({ host: '127.0.0.1', port: 1 }, opts), reply)
+  t.is(contextReads, 0)
+  t.is(optionReads, 1)
+  t.is(forwarded.retry, false)
+  t.is(forwarded.ttl, 9)
+  t.is(forwarded[marker], 'kept')
+  t.is(forwarded.session, session)
+  t.is('transportContext' in forwarded, false)
+})
+
+test('transport-only session ping excludes transport context capability', async (t) => {
+  const Session = require('../lib/session')
+  const marker = Symbol('marker')
+  let forwarded = null
+  let contextReads = 0
+  let optionReads = 0
+  const reply = { ok: true }
+  const dht = {
+    outboundPolicy: 'transport-only',
+    ping(to, opts) {
+      forwarded = opts
+      return Promise.resolve(reply)
+    }
+  }
+  const session = new Session(dht)
+  const opts = { retry: false, session: { wrong: true } }
+  Object.defineProperty(opts, 'size', {
+    enumerable: true,
+    get() {
+      optionReads++
+      return 8
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('transport-only session ping read transport context')
+    }
+  })
+  opts[marker] = 'kept'
+
+  t.is(await session.ping({ ref: 'destination' }, opts), reply)
+  t.is(contextReads, 0)
+  t.is(optionReads, 1)
+  t.is(forwarded.retry, false)
+  t.is(forwarded.size, 8)
+  t.is(forwarded[marker], 'kept')
+  t.is(forwarded.session, session)
+  t.is('transportContext' in forwarded, false)
+})
+
+test('destroyed session ping wins without reading transport context', async (t) => {
+  const Session = require('../lib/session')
+
+  for (const outboundPolicy of ['direct', 'transport-only']) {
+    const terminal = new Error(`${outboundPolicy} session closed`)
+    let contextReads = 0
+    let pingCalls = 0
+    const dht = {
+      outboundPolicy,
+      ping() {
+        pingCalls++
+        return Promise.resolve()
+      }
+    }
+    const session = new Session(dht)
+    session.destroy(terminal)
+    const opts = {}
+    Object.defineProperty(opts, 'transportContext', {
+      enumerable: true,
+      get() {
+        contextReads++
+        throw new Error('destroyed session ping read transport context')
+      }
+    })
+
+    t.is(await promiseError(session.ping({ ref: 'destination' }, opts)), terminal)
+    t.is(contextReads, 0)
+    t.is(pingCalls, 0)
+  }
 })
 
 test('session query and request preserve explicit null options', async (t) => {
