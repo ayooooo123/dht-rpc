@@ -2748,6 +2748,112 @@ test('transport-only query admits closest bootstrap caller nodes and replies', a
   await dht.destroy()
 })
 
+test('transport-only query ignores inherited nodes without skipping adapter discovery', async (t) => {
+  const closest = { ref: 'closest' }
+  const bootstrap = { ref: 'bootstrap' }
+  const ids = opaqueIds([closest, bootstrap])
+  const visited = []
+  let inheritedReads = 0
+  const transport = createOpaqueTransport({
+    closest: [closest],
+    bootstrap: [bootstrap],
+    ids,
+    request(message) {
+      visited.push(message.to)
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const opts = Object.create({
+    get nodes() {
+      inheritedReads++
+      throw new Error('transport-only read inherited nodes')
+    }
+  })
+  opts.concurrency = 1
+
+  const query = dht.query({ target: b4a.alloc(32), command: 7 }, opts)
+  await query.finished()
+
+  t.is(inheritedReads, 0)
+  t.alike(visited, [bootstrap, closest])
+  t.is(transport.calls.closest.length, 1)
+  t.is(transport.calls.bootstrap.length, 1)
+  await dht.destroy()
+})
+
+test('transport-only query accepts own data nodes and rejects hostile ownership checks', async (t) => {
+  const destination = { ref: 'caller-node' }
+  const transport = createOpaqueTransport({
+    ids: opaqueIds([destination]),
+    request(message) {
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { nodes: [destination], concurrency: 1 }
+  )
+  await query.finished()
+
+  t.is(transport.calls.request.length, 1)
+  t.is(transport.calls.request[0][0].to, destination)
+
+  let accessorReads = 0
+  const accessorOpts = {}
+  Object.defineProperty(accessorOpts, 'nodes', {
+    enumerable: true,
+    get() {
+      accessorReads++
+      throw new Error('transport-only invoked own nodes accessor')
+    }
+  })
+  const accessorError = syncError(() =>
+    dht.query({ target: b4a.alloc(32), command: 7 }, accessorOpts)
+  )
+
+  t.is(accessorReads, 0)
+  t.is(accessorError && accessorError.code, 'TRANSPORT_INVALID_RESPONSE')
+
+  const proxyError = syncError(() =>
+    dht.query(
+      { target: b4a.alloc(32), command: 7 },
+      new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor(target, property) {
+            if (property === 'nodes') throw new Error('transport-only descriptor trap')
+            return Reflect.getOwnPropertyDescriptor(target, property)
+          }
+        }
+      )
+    )
+  )
+
+  t.is(proxyError && proxyError.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(transport.calls.request.length, 1)
+  await dht.destroy()
+})
+
+test('direct query preserves inherited nodes lookup behavior', async (t) => {
+  const expected = new Error('direct inherited nodes')
+  let inheritedReads = 0
+  const opts = Object.create({
+    get nodes() {
+      inheritedReads++
+      throw expected
+    }
+  })
+  const dht = new DHT({ bootstrap: false })
+
+  const error = syncError(() => dht.query({ target: b4a.alloc(32), command: 7 }, opts))
+
+  t.is(error, expected)
+  t.is(inheritedReads, 1)
+  await dht.destroy()
+})
+
 test('transport-only query validates every bootstrap entry before requesting', async (t) => {
   for (const [name, bootstrap, ids] of invalidBootstrapCases()) {
     const transport = createOpaqueTransport({ bootstrap, ids })
