@@ -439,7 +439,7 @@ class DHT extends EventEmitter {
     return candidate
   }
 
-  _closestQueryNodes(target, limit, registry, added = null) {
+  _closestQueryNodes(target, limit, registry, added = null, context = null) {
     if (this.outboundPolicy === 'direct') {
       const closest = this.table.closest(target, limit)
       return closest.map((node) =>
@@ -449,7 +449,7 @@ class DHT extends EventEmitter {
 
     let closest = null
     try {
-      closest = this.io.closest({ target, limit })
+      closest = this.io.closest({ target, limit, context })
       if (closest === null || closest === undefined) throw TRANSPORT_INVALID_RESPONSE()
       const candidates = []
       if (limit <= 0) return candidates
@@ -464,7 +464,7 @@ class DHT extends EventEmitter {
     }
   }
 
-  async *_resolveQueryBootstrap(target, limit, registry, added = null) {
+  async *_resolveQueryBootstrap(target, limit, registry, added = null, context = null) {
     if (this.outboundPolicy === 'direct') {
       for await (const node of this._resolveBootstrapNodes()) {
         yield this._queryCandidate(node, registry)
@@ -474,7 +474,7 @@ class DHT extends EventEmitter {
 
     let bootstrap = null
     try {
-      bootstrap = await this.io.bootstrap({ target, limit })
+      bootstrap = await this.io.bootstrap({ target, limit, context })
       if (bootstrap === null || bootstrap === undefined) throw TRANSPORT_INVALID_RESPONSE()
       if (limit <= 0) return
       let count = 0
@@ -493,7 +493,7 @@ class DHT extends EventEmitter {
       forbidDirectRequestOptions(opts)
       if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
       const value = opts && opts.size && opts.size > 0 ? b4a.alloc(opts.size) : null
-      return this._transportRequestToPromise(to, null, true, PING, null, value, opts)
+      return this._transportRequestToPromise(to, null, true, PING, null, value, opts, 0, null, null)
     }
 
     if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
@@ -534,7 +534,9 @@ class DHT extends EventEmitter {
         null,
         value,
         opts,
-        delayMs + 1_000
+        delayMs + 1_000,
+        null,
+        null
       )
     }
 
@@ -616,8 +618,20 @@ class DHT extends EventEmitter {
     if (this.outboundPolicy === 'transport-only') {
       forbidDirectRequestOptions(opts)
       const { token = null, command, target = null, value = null } = message
+      const transportContext = opts ? opts.transportContext : null
       if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
-      return this._transportRequestToPromise(to, token, false, command, target, value, opts)
+      return this._transportRequestToPromise(
+        to,
+        token,
+        false,
+        command,
+        target,
+        value,
+        opts,
+        0,
+        null,
+        transportContext === undefined ? null : transportContext
+      )
     }
 
     const { token = null, command, target = null, value = null } = message
@@ -662,7 +676,8 @@ class DHT extends EventEmitter {
     value,
     opts,
     timeout = 0,
-    candidate = null
+    candidate = null,
+    context = null
   ) {
     let req = null
     try {
@@ -674,7 +689,8 @@ class DHT extends EventEmitter {
         target,
         value,
         (opts && opts.session) || null,
-        candidate
+        candidate,
+        context
       )
     } catch (error) {
       return Promise.reject(error)
@@ -684,7 +700,12 @@ class DHT extends EventEmitter {
     return this._requestToPromise(req, opts)
   }
 
-  _queryCandidateRequest({ token = null, command, target = null, value = null }, candidate, opts) {
+  _queryCandidateRequest(
+    { token = null, command, target = null, value = null },
+    candidate,
+    opts,
+    context = null
+  ) {
     if (this.outboundPolicy === 'direct') {
       return this.request({ token, command, target, value }, candidate.destination, opts)
     }
@@ -697,7 +718,8 @@ class DHT extends EventEmitter {
       value,
       opts,
       0,
-      candidate
+      candidate,
+      context
     )
   }
 
@@ -802,7 +824,8 @@ class DHT extends EventEmitter {
     onresponse,
     onerror,
     configure,
-    candidate = null
+    candidate = null,
+    context = null
   ) {
     if (this.outboundPolicy === 'transport-only') {
       if (candidate === null) throw DIRECT_IO_FORBIDDEN()
@@ -816,7 +839,8 @@ class DHT extends EventEmitter {
         target,
         value,
         session,
-        candidate
+        candidate,
+        context
       )
       if (req === null) return null
       req.onresponse = onresponse

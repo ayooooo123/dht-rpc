@@ -933,6 +933,7 @@ test('transport-only request preserves opaque authority and normalizes replies',
     command: 7,
     target,
     value,
+    context: null,
     attempt: 1
   })
   t.is('host' in transport.calls.request[0][0], false)
@@ -1946,6 +1947,201 @@ test('request configuration runs before first send', (t) => {
   )
 })
 
+test('transport-only query keeps one opaque context through discovery requests and commit', async (t) => {
+  const context = Object.freeze({ route: 'query-a' })
+  const a = { ref: 'a' }
+  const b = { ref: 'b' }
+  const traversalAttempts = new Map()
+  const commitAttempts = new Map()
+  let contextReads = 0
+  const transport = createOpaqueTransport({
+    closest: [a],
+    bootstrap: [b],
+    ids: opaqueIds([a, b]),
+    request(message) {
+      const attempts = message.token === null ? traversalAttempts : commitAttempts
+      const attempt = (attempts.get(message.to) || 0) + 1
+      attempts.set(message.to, attempt)
+
+      if (
+        (message.token === null && message.to === b) ||
+        (message.token !== null && message.to === a)
+      ) {
+        if (attempt === 1) {
+          return {
+            promise: Promise.reject(new Error('retry once')),
+            cancel() {}
+          }
+        }
+      }
+
+      return immediateOperation(
+        validReply(message.to, {
+          token: message.token === null ? b4a.alloc(32, message.to === a ? 1 : 2) : null
+        })
+      )
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const opts = { concurrency: 1, commit: true }
+  Object.defineProperty(opts, 'transportContext', {
+    get() {
+      contextReads++
+      return context
+    }
+  })
+
+  await dht.query({ target: b4a.alloc(32), command: 7 }, opts).finished()
+
+  t.is(contextReads, 1)
+  t.is(transport.calls.closest.length, 1)
+  t.is(transport.calls.closest[0][0].context, context)
+  t.is(transport.calls.bootstrap.length, 1)
+  t.is(transport.calls.bootstrap[0][0].context, context)
+  t.alike([...traversalAttempts.values()].sort(), [1, 2])
+  t.alike([...commitAttempts.values()].sort(), [1, 2])
+  for (const [message] of transport.calls.request) t.is(message.context, context)
+
+  await dht.destroy()
+})
+
+test('transport-only concurrent queries keep their opaque contexts isolated', async (t) => {
+  const firstContext = Object.freeze({ route: 'first' })
+  const secondContext = Object.freeze({ route: 'second' })
+  const first = { ref: 'first' }
+  const second = { ref: 'second' }
+  const transport = createOpaqueTransport({ ids: opaqueIds([first, second]) })
+  const dht = createTransportDHT(transport)
+  let firstReads = 0
+  let secondReads = 0
+  const firstOpts = { nodes: [first], concurrency: 1 }
+  const secondOpts = { nodes: [second], concurrency: 1 }
+  Object.defineProperty(firstOpts, 'transportContext', {
+    get() {
+      firstReads++
+      return firstContext
+    }
+  })
+  Object.defineProperty(secondOpts, 'transportContext', {
+    get() {
+      secondReads++
+      return secondContext
+    }
+  })
+
+  const firstQuery = dht.query({ target: b4a.alloc(32, 1), command: 7 }, firstOpts)
+  const secondQuery = dht.query({ target: b4a.alloc(32, 2), command: 7 }, secondOpts)
+  const firstFinished = firstQuery.finished()
+  const secondFinished = secondQuery.finished()
+  await waitFor(() => transport.requests.length === 2)
+
+  const byDestination = new Map(
+    transport.calls.request.map(([message]) => [message.to, message.context])
+  )
+  t.is(byDestination.get(first), firstContext)
+  t.is(byDestination.get(second), secondContext)
+  t.is(firstReads, 1)
+  t.is(secondReads, 1)
+
+  for (let i = 0; i < transport.requests.length; i++) {
+    transport.requests[i].resolve(validReply(transport.calls.request[i][0].to))
+  }
+  await Promise.all([firstFinished, secondFinished])
+  await dht.destroy()
+})
+
+test('standalone transport request snapshots context while direct request ignores it', async (t) => {
+  const context = Object.freeze({ route: 'standalone' })
+  let transportReads = 0
+  let attempts = 0
+  const transport = createTransport({
+    request(message) {
+      transport.calls.request.push([message])
+      attempts++
+      if (attempts === 1) {
+        return {
+          promise: Promise.reject(new Error('retry once')),
+          cancel() {}
+        }
+      }
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const routed = createTransportDHT(transport)
+  const routedOpts = {}
+  Object.defineProperty(routedOpts, 'transportContext', {
+    get() {
+      transportReads++
+      return context
+    }
+  })
+
+  await routed.request({ command: 7 }, transport.destinations[0], routedOpts)
+
+  t.is(transportReads, 1)
+  t.alike(
+    transport.calls.request.map(([message]) => message.attempt),
+    [1, 2]
+  )
+  for (const [message] of transport.calls.request) t.is(message.context, context)
+  await routed.destroy()
+
+  let directReads = 0
+  let createArgs = null
+  const req = {
+    retries: 3,
+    onresponse: null,
+    onerror: null,
+    send() {
+      this.onresponse({ ok: true })
+    }
+  }
+  const direct = Object.create(DHT.prototype)
+  direct.outboundPolicy = 'direct'
+  direct.io = {
+    createRequest(...args) {
+      createArgs = args
+      return req
+    }
+  }
+  const token = b4a.alloc(32, 3)
+  const target = b4a.alloc(32, 4)
+  const value = b4a.from('unchanged')
+  const directOpts = { ttl: 9, retry: false }
+  Object.defineProperty(directOpts, 'transportContext', {
+    get() {
+      directReads++
+      throw new Error('direct mode read transport context')
+    }
+  })
+
+  await direct.request(
+    { token, command: 7, target, value },
+    { host: '127.0.0.1', port: 1234 },
+    directOpts
+  )
+
+  t.is(directReads, 0)
+  t.alike(createArgs, [
+    { id: null, host: '127.0.0.1', port: 1234 },
+    token,
+    false,
+    7,
+    target,
+    value,
+    null,
+    9
+  ])
+  t.is(req.retries, 0)
+
+  const directDHT = new DHT({ bootstrap: false })
+  const directQuery = directDHT.query({ target: b4a.alloc(32), command: 7 }, directOpts)
+  t.is(directReads, 0)
+  directQuery.destroy()
+  await directQuery.finished()
+  await directDHT.destroy()
+})
+
 test('transport-only query traverses opaque destinations by adapter identity', async (t) => {
   const a = { ref: 'a' }
   const b = { ref: 'b' }
@@ -2063,8 +2259,8 @@ test('transport-only query admits closest bootstrap caller nodes and replies', a
   await fromNodes.finished()
 
   t.alike(new Set(visited), new Set([a, b, c]))
-  t.alike(transport.calls.closest[0][0], { target, limit: 19 })
-  t.alike(transport.calls.bootstrap[0][0], { target, limit: 18 })
+  t.alike(transport.calls.closest[0][0], { target, limit: 19, context: null })
+  t.alike(transport.calls.bootstrap[0][0], { target, limit: 18, context: null })
 
   transport.localClosest = []
   transport.remoteBootstrap = []
