@@ -618,8 +618,8 @@ class DHT extends EventEmitter {
     if (this.outboundPolicy === 'transport-only') {
       forbidDirectRequestOptions(opts)
       const { token = null, command, target = null, value = null } = message
-      const transportContext = opts ? opts.transportContext : null
       if (opts && opts.session && opts.session.destroyed) return Promise.reject(opts.session.error)
+      const transportContext = opts ? opts.transportContext : null
       return this._transportRequestToPromise(
         to,
         token,

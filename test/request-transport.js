@@ -1947,6 +1947,202 @@ test('request configuration runs before first send', (t) => {
   )
 })
 
+test('direct session query skips an enumerable transport context', (t) => {
+  const Session = require('../lib/session')
+  const marker = Symbol('marker')
+  let forwarded = null
+  let contextReads = 0
+  let optionReads = 0
+  const result = {}
+  const dht = {
+    outboundPolicy: 'direct',
+    query(message, opts) {
+      forwarded = opts
+      return result
+    }
+  }
+  const session = new Session(dht)
+  const nodes = []
+  const opts = { nodes, session: { wrong: true } }
+  Object.defineProperty(opts, 'concurrency', {
+    enumerable: true,
+    get() {
+      optionReads++
+      return 2
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('direct session query read transport context')
+    }
+  })
+  opts[marker] = 'kept'
+
+  const message = { target: b4a.alloc(32), command: 7 }
+  t.is(session.query(message, opts), result)
+  t.is(contextReads, 0)
+  t.is(optionReads, 1)
+  t.is(forwarded.nodes, nodes)
+  t.is(forwarded.concurrency, 2)
+  t.is(forwarded[marker], 'kept')
+  t.is(forwarded.session, session)
+  t.is('transportContext' in forwarded, false)
+})
+
+test('direct session request skips an enumerable transport context', async (t) => {
+  const Session = require('../lib/session')
+  const marker = Symbol('marker')
+  let forwarded = null
+  let contextReads = 0
+  let optionReads = 0
+  const reply = { ok: true }
+  const dht = {
+    outboundPolicy: 'direct',
+    request(message, to, opts) {
+      forwarded = opts
+      return Promise.resolve(reply)
+    }
+  }
+  const session = new Session(dht)
+  const opts = { retry: false, session: { wrong: true } }
+  Object.defineProperty(opts, 'ttl', {
+    enumerable: true,
+    get() {
+      optionReads++
+      return 9
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    enumerable: true,
+    get() {
+      contextReads++
+      throw new Error('direct session request read transport context')
+    }
+  })
+  opts[marker] = 'kept'
+
+  t.is(await session.request({ command: 7 }, { host: '127.0.0.1', port: 1 }, opts), reply)
+  t.is(contextReads, 0)
+  t.is(optionReads, 1)
+  t.is(forwarded.retry, false)
+  t.is(forwarded.ttl, 9)
+  t.is(forwarded[marker], 'kept')
+  t.is(forwarded.session, session)
+  t.is('transportContext' in forwarded, false)
+})
+
+test('transport-only session query snapshots a non-enumerable transport context', (t) => {
+  const Session = require('../lib/session')
+  const context = Object.freeze({ route: 'session-query' })
+  let forwarded = null
+  let contextReads = 0
+  let optionReads = 0
+  const result = {}
+  const dht = {
+    outboundPolicy: 'transport-only',
+    query(message, opts) {
+      forwarded = opts
+      return result
+    }
+  }
+  const session = new Session(dht)
+  const nodes = []
+  const opts = { nodes, session: { wrong: true } }
+  Object.defineProperty(opts, 'concurrency', {
+    enumerable: true,
+    get() {
+      optionReads++
+      return 2
+    }
+  })
+  Object.defineProperty(opts, 'transportContext', {
+    get() {
+      contextReads++
+      return context
+    }
+  })
+
+  const message = { target: b4a.alloc(32), command: 7 }
+  t.is(session.query(message, opts), result)
+  t.is(contextReads, 1)
+  t.is(optionReads, 1)
+  t.is(forwarded.nodes, nodes)
+  t.is(forwarded.concurrency, 2)
+  t.is(forwarded.transportContext, context)
+  t.is(forwarded.session, session)
+})
+
+test('transport-only session request snapshots an inherited transport context', async (t) => {
+  const Session = require('../lib/session')
+  const context = Object.freeze({ route: 'session-request' })
+  let forwarded = null
+  let contextReads = 0
+  let optionReads = 0
+  const reply = { ok: true }
+  const dht = {
+    outboundPolicy: 'transport-only',
+    request(message, to, opts) {
+      forwarded = opts
+      return Promise.resolve(reply)
+    }
+  }
+  const session = new Session(dht)
+  const prototype = {}
+  Object.defineProperty(prototype, 'transportContext', {
+    get() {
+      contextReads++
+      return context
+    }
+  })
+  const opts = Object.create(prototype)
+  opts.retry = false
+  opts.session = { wrong: true }
+  Object.defineProperty(opts, 'ttl', {
+    enumerable: true,
+    get() {
+      optionReads++
+      return 9
+    }
+  })
+
+  t.is(await session.request({ command: 7 }, { ref: 'destination' }, opts), reply)
+  t.is(contextReads, 1)
+  t.is(optionReads, 1)
+  t.is(forwarded.retry, false)
+  t.is(forwarded.ttl, 9)
+  t.is(forwarded.transportContext, context)
+  t.is(forwarded.session, session)
+})
+
+test('session query and request preserve explicit null options', async (t) => {
+  const Session = require('../lib/session')
+
+  for (const outboundPolicy of ['direct', 'transport-only']) {
+    let queryOpts = null
+    let requestOpts = null
+    const result = {}
+    const dht = {
+      outboundPolicy,
+      query(message, opts) {
+        queryOpts = opts
+        return result
+      },
+      request(message, to, opts) {
+        requestOpts = opts
+        return Promise.resolve(result)
+      }
+    }
+    const session = new Session(dht)
+
+    t.is(session.query({ target: b4a.alloc(32), command: 7 }, null), result)
+    t.is(await session.request({ command: 7 }, { host: '127.0.0.1', port: 1 }, null), result)
+    t.is(queryOpts.session, session)
+    t.is(requestOpts.session, session)
+  }
+})
+
 test('transport-only query keeps one opaque context through discovery requests and commit', async (t) => {
   const context = Object.freeze({ route: 'query-a' })
   const a = { ref: 'a' }
@@ -2002,6 +2198,99 @@ test('transport-only query keeps one opaque context through discovery requests a
   t.alike([...commitAttempts.values()].sort(), [1, 2])
   for (const [message] of transport.calls.request) t.is(message.context, context)
 
+  await dht.destroy()
+})
+
+test('transport-only query keeps its private context snapshot before open', async (t) => {
+  const context = Object.freeze({ route: 'original-query' })
+  const replacement = Object.freeze({ route: 'replacement-query' })
+  const destination = { ref: 'query-destination' }
+  const transport = createOpaqueTransport({
+    closest: [destination],
+    ids: opaqueIds([destination]),
+    request(message) {
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+  const query = dht.query(
+    { target: b4a.alloc(32), command: 7 },
+    { concurrency: 1, transportContext: context }
+  )
+  const descriptor = Object.getOwnPropertyDescriptor(query, '_transportContext')
+
+  t.is(Object.getOwnPropertyDescriptor(query, 'transportContext'), undefined)
+  t.is(descriptor && descriptor.value, context)
+  t.is(descriptor && descriptor.writable, false)
+  t.is(descriptor && descriptor.configurable, false)
+  query.transportContext = replacement
+  query._transportContext = replacement
+
+  await query.finished()
+
+  t.is(transport.calls.closest[0][0].context, context)
+  for (const [message] of transport.calls.request) t.is(message.context, context)
+  await dht.destroy()
+})
+
+test('transport-only request keeps its private context snapshot between retries', async (t) => {
+  const context = Object.freeze({ route: 'original-request' })
+  const replacement = Object.freeze({ route: 'replacement-request' })
+  let dht = null
+  let request = null
+  const transport = createTransport({
+    request(message) {
+      transport.calls.request.push([message])
+      request = dht.io.inflight[0]
+      if (message.attempt === 1) {
+        t.is(Object.getOwnPropertyDescriptor(request, 'context'), undefined)
+        const descriptor = Object.getOwnPropertyDescriptor(request, '_transportContext')
+        t.is(descriptor && descriptor.value, context)
+        t.is(descriptor && descriptor.writable, false)
+        t.is(descriptor && descriptor.configurable, false)
+        request.context = replacement
+        request._transportContext = replacement
+        return {
+          promise: Promise.reject(new Error('retry once')),
+          cancel() {}
+        }
+      }
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  dht = createTransportDHT(transport)
+
+  await dht.request({ command: 7 }, transport.destinations[0], { transportContext: context })
+
+  t.alike(
+    transport.calls.request.map(([message]) => message.attempt),
+    [1, 2]
+  )
+  for (const [message] of transport.calls.request) t.is(message.context, context)
+  t.is(request._transportContext, context)
+  await dht.destroy()
+})
+
+test('destroyed transport-only request session wins without reading context', async (t) => {
+  const transport = createTransport()
+  const dht = createTransportDHT(transport)
+  const session = dht.session()
+  const terminal = new Error('session already closed')
+  let contextReads = 0
+  session.destroy(terminal)
+  const opts = { session }
+  Object.defineProperty(opts, 'transportContext', {
+    get() {
+      contextReads++
+      throw new Error('destroyed request read transport context')
+    }
+  })
+
+  const error = await callError(() => dht.request({ command: 7 }, transport.destinations[0], opts))
+
+  t.is(error, terminal)
+  t.is(contextReads, 0)
+  t.is(transport.calls.request.length, 0)
   await dht.destroy()
 })
 
