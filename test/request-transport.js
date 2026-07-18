@@ -2836,6 +2836,136 @@ test('transport-only query accepts own data nodes and rejects hostile ownership 
   await dht.destroy()
 })
 
+test('transport-only query normalizes every nodes descriptor trap throw', async (t) => {
+  const spoofed = new Error('attacker-controlled transport error')
+  spoofed.code = 'TRANSPORT_INVALID_RESPONSE'
+  const privateShaped = Object.freeze({
+    code: 'TRANSPORT_INVALID_RESPONSE',
+    name: 'DHTError',
+    message: 'attacker-controlled private error'
+  })
+  const transport = createOpaqueTransport()
+  const dht = createTransportDHT(transport)
+
+  for (const [name, thrown] of [
+    ['spoofed error code', spoofed],
+    ['primitive', 7],
+    ['private-shaped object', privateShaped]
+  ]) {
+    const error = syncError(() =>
+      dht.query(
+        { target: b4a.alloc(32), command: 7 },
+        new Proxy(
+          {},
+          {
+            getOwnPropertyDescriptor(target, property) {
+              if (property === 'nodes') throw thrown
+              return Reflect.getOwnPropertyDescriptor(target, property)
+            }
+          }
+        )
+      )
+    )
+
+    t.is(error === thrown, false, `${name} identity`)
+    t.is(error && error.name, 'DHTError', `${name} name`)
+    t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE', `${name} code`)
+    t.is(
+      error && error.message,
+      'TRANSPORT_INVALID_RESPONSE: Invalid request transport response',
+      `${name} message`
+    )
+  }
+
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+test('transport-only query rejects nodes accessors under prototype pollution', async (t) => {
+  const polluted = { ref: 'polluted-seed' }
+  const transport = createOpaqueTransport({ ids: opaqueIds([polluted]) })
+  const dht = createTransportDHT(transport)
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'value')
+  const opts = {}
+  let accessorReads = 0
+  let query = null
+  Object.defineProperty(opts, 'nodes', {
+    get() {
+      accessorReads++
+      return [polluted]
+    }
+  })
+
+  let error = null
+  try {
+    Object.defineProperty(Object.prototype, 'value', {
+      value: [polluted],
+      writable: true,
+      configurable: true
+    })
+    error = syncError(() => {
+      query = dht.query({ target: b4a.alloc(32), command: 7 }, opts)
+    })
+  } finally {
+    if (previous === undefined) delete Object.prototype.value
+    else Object.defineProperty(Object.prototype, 'value', previous)
+  }
+
+  if (query !== null) {
+    query.destroy()
+    await query.finished()
+  }
+  t.is(query, null)
+  t.is(accessorReads, 0)
+  t.is(error && error.code, 'TRANSPORT_INVALID_RESPONSE')
+  t.is(transport.calls.request.length, 0)
+  await dht.destroy()
+})
+
+test('transport-only query preserves falsy nodes and reply fallbacks', async (t) => {
+  const destinations = Array.from({ length: 6 }, (_, i) => ({ ref: `fallback-${i}` }))
+  const visited = []
+  const transport = createOpaqueTransport({
+    ids: opaqueIds(destinations),
+    request(message) {
+      visited.push(message.to)
+      return immediateOperation(validReply(message.to))
+    }
+  })
+  const dht = createTransportDHT(transport)
+
+  for (let i = 0; i < 4; i++) {
+    const opts = { closestNodes: [destinations[i]], concurrency: 1 }
+    Object.defineProperty(opts, 'nodes', {
+      value: [undefined, null, false, 0][i],
+      enumerable: true
+    })
+    await dht.query({ target: b4a.alloc(32), command: 7 }, opts).finished()
+  }
+
+  await dht
+    .query(
+      { target: b4a.alloc(32), command: 7 },
+      { replies: null, closestReplies: [{ from: destinations[4] }], concurrency: 1 }
+    )
+    .finished()
+  await dht
+    .query(
+      { target: b4a.alloc(32), command: 7 },
+      {
+        nodes: false,
+        closestNodes: null,
+        replies: false,
+        closestReplies: [{ from: destinations[5] }],
+        concurrency: 1
+      }
+    )
+    .finished()
+
+  t.alike(visited, destinations)
+  await dht.destroy()
+})
+
 test('direct query preserves inherited nodes lookup behavior', async (t) => {
   const expected = new Error('direct inherited nodes')
   let inheritedReads = 0
